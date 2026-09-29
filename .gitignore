@@ -1,0 +1,12 @@
+.env
+__pycache__/
+.dockerignore
+.venv
+plans/
+logs/
+test_results/
+data/measurements/*.json
+*.pyc
+
+# Keep audit deliverables + skill docs trackable (rest of *.md still free to add)
+# (previously ignored all markdown via *.md)

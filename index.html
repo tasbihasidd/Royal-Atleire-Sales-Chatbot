@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Royal Atelier — AI Sales Agent Workbench</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --midnight-900: #041224;
+      --midnight-800: #09203f;
+      --midnight-700: #0f305c;
+      --gold-primary: #D4AF37;
+      --gold-light: #f5e7b8;
+      --gold-dark: #aa851c;
+      --parchment: #f8fafc;
+      --card-bg: #ffffff;
+      --border-subtle: #e2e8f0;
+      --border-gold: rgba(212, 175, 55, 0.4);
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --success: #10b981;
+      --error: #ef4444;
+      --shadow-elevation: 0 10px 30px -5px rgba(9, 32, 63, 0.08), 0 4px 12px -2px rgba(9, 32, 63, 0.04);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: #f1f5f9;
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top Navigation Header */
+    .top-nav {
+      background: linear-gradient(135deg, var(--midnight-900), var(--midnight-800));
+      border-bottom: 2px solid var(--gold-primary);
+      color: white;
+      padding: 14px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-crest {
+      width: 38px;
+      height: 38px;
+      background: radial-gradient(circle, var(--gold-primary), var(--gold-dark));
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Cinzel', serif;
+      font-weight: 800;
+      color: var(--midnight-900);
+      font-size: 18px;
+      box-shadow: 0 0 14px rgba(212, 175, 55, 0.5);
+    }
+
+    .brand-title {
+      font-family: 'Cinzel', serif;
+      font-size: 20px;
+      letter-spacing: 0.5px;
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .brand-subtitle {
+      font-size: 11px;
+      color: var(--gold-light);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      opacity: 0.9;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: 1px solid transparent;
+    }
+
+    .btn-gold {
+      background: linear-gradient(135deg, var(--gold-primary), var(--gold-dark));
+      color: var(--midnight-900);
+      font-weight: 700;
+      box-shadow: 0 2px 8px rgba(212, 175, 55, 0.3);
+    }
+
+    .btn-gold:hover {
+      filter: brightness(1.08);
+      transform: translateY(-1px);
+    }
+
+    .btn-outline {
+      background: rgba(255, 255, 255, 0.08);
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-outline:hover {
+      background: rgba(255, 255, 255, 0.15);
+      border-color: var(--gold-primary);
+    }
+
+    .btn-danger-outline {
+      background: rgba(239, 68, 68, 0.12);
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .btn-danger-outline:hover {
+      background: #ef4444;
+      color: white;
+    }
+
+    /* Main Container Layout */
+    .app-container {
+      flex: 1;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 18px 24px 28px;
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      gap: 20px;
+      align-items: start;
+    }
+
+    /* Left: Chat Column */
+    .chat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      box-shadow: var(--shadow-elevation);
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 120px);
+      overflow: hidden;
+    }
+
+    /* Session Toolbar */
+    .session-toolbar {
+      background: #fafafa;
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 12px 18px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .session-switch-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 320px;
+    }
+
+    .field-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 700;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .select-input, .text-input {
+      font-family: inherit;
+      font-size: 13px;
+      padding: 7px 11px;
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      background: #ffffff;
+      color: var(--text-main);
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .select-input:focus, .text-input:focus {
+      border-color: var(--gold-primary);
+      box-shadow: 0 0 0 3px rgba(212, 175, 55, 0.15);
+    }
+
+    .select-input {
+      flex: 1;
+      max-width: 260px;
+    }
+
+    .session-quick-btn {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: white;
+      border: 1px solid var(--border-subtle);
+      cursor: pointer;
+      color: var(--midnight-800);
+      font-weight: 600;
+    }
+
+    .session-quick-btn:hover {
+      border-color: var(--gold-primary);
+      background: #fffdf8;
+    }
+
+    /* Message Thread */
+    .messages-viewport {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      background: radial-gradient(circle at 10% 10%, rgba(212, 175, 55, 0.03), transparent 40%), #f8fafc;
+    }
+
+    .message-row {
+      display: flex;
+      flex-direction: column;
+      animation: fadeIn 0.25s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message-row.user {
+      align-items: flex-end;
+    }
+
+    .message-row.assistant {
+      align-items: flex-start;
+    }
+
+    .bubble-wrapper {
+      max-width: 80%;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .message-sender {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .user .message-sender {
+      justify-content: flex-end;
+    }
+
+    .bubble {
+      padding: 14px 18px;
+      border-radius: 14px;
+      font-size: 14px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+    }
+
+    .user .bubble {
+      background: var(--midnight-800);
+      color: #ffffff;
+      border-bottom-right-radius: 3px;
+    }
+
+    .assistant .bubble {
+      background: #ffffff;
+      color: var(--text-main);
+      border: 1px solid var(--border-subtle);
+      border-bottom-left-radius: 3px;
+    }
+
+    /* Attached Outfit Image */
+    .bubble-image-container {
+      margin-top: 10px;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid var(--border-gold);
+      background: #ffffff;
+      max-width: 320px;
+    }
+
+    .bubble-image {
+      width: 100%;
+      height: 220px;
+      object-fit: cover;
+      display: block;
+      transition: transform 0.3s ease;
+    }
+
+    .bubble-image:hover {
+      transform: scale(1.03);
+    }
+
+    .bubble-image-caption {
+      padding: 6px 10px;
+      font-size: 11px;
+      color: var(--text-muted);
+      background: #fafafa;
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Node Execution Trace Badge Strip */
+    .node-trace-strip {
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 7px 11px;
+      background: #f8fafc;
+      border: 1px solid rgba(212, 175, 55, 0.3);
+      border-radius: 8px;
+      font-size: 11px;
+      width: fit-content;
+      max-width: 100%;
+    }
+
+    .trace-title {
+      font-weight: 700;
+      color: var(--gold-dark);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-size: 10px;
+    }
+
+    .node-pill {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      color: var(--midnight-800);
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .node-pill.planner {
+      background: #eff6ff;
+      border-color: #93c5fd;
+      color: #1d4ed8;
+    }
+
+    .node-pill.products, .node-pill.get_product_details {
+      background: #f0fdf4;
+      border-color: #86efac;
+      color: #15803d;
+    }
+
+    .node-pill.negotiation {
+      background: #fefce8;
+      border-color: #fde047;
+      color: #a16207;
+    }
+
+    .node-pill.final_response {
+      background: #faf5ff;
+      border-color: #d8b4fe;
+      color: #7e22ce;
+    }
+
+    .node-arrow {
+      color: #94a3b8;
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    /* Composer */
+    .composer-section {
+      background: #ffffff;
+      border-top: 1px solid var(--border-subtle);
+      padding: 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .quick-prompts-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      scrollbar-width: thin;
+    }
+
+    .prompt-chip {
+      background: #f8fafc;
+      border: 1px solid var(--border-subtle);
+      border-radius: 999px;
+      padding: 4px 11px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--midnight-700);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+    }
+
+    .prompt-chip:hover {
+      border-color: var(--gold-primary);
+      background: #fffdf8;
+      color: var(--midnight-900);
+    }
+
+    .prompt-chip.special-variation {
+      border-color: var(--gold-primary);
+      background: #fefce8;
+      color: #92400e;
+    }
+
+    .composer-input-row {
+      display: flex;
+      gap: 10px;
+    }
+
+    .chat-textarea {
+      flex: 1;
+      padding: 10px 14px;
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+      resize: none;
+      height: 48px;
+      line-height: 26px;
+      transition: border-color 0.2s;
+    }
+
+    .chat-textarea:focus {
+      border-color: var(--gold-primary);
+      box-shadow: 0 0 0 3px rgba(212, 175, 55, 0.15);
+    }
+
+    .send-btn {
+      padding: 0 20px;
+      background: linear-gradient(135deg, var(--gold-primary), var(--gold-dark));
+      border: none;
+      border-radius: 10px;
+      color: var(--midnight-900);
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .send-btn:hover {
+      filter: brightness(1.08);
+    }
+
+    .send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Right: Diagnostic & State Panel */
+    .diagnostic-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      box-shadow: var(--shadow-elevation);
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 120px);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      background: #fafafa;
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 12px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-title {
+      font-family: 'Cinzel', serif;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--midnight-900);
+      letter-spacing: 0.3px;
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .info-card {
+      background: #f8fafc;
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .info-card-header {
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      row-gap: 6px;
+      font-size: 12px;
+    }
+
+    .kv-key {
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .kv-val {
+      color: var(--text-main);
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    .kv-val.highlight {
+      color: var(--gold-dark);
+    }
+
+    .state-json {
+      background: #091322;
+      color: #e2e8f0;
+      font-family: monospace;
+      font-size: 11px;
+      padding: 10px;
+      border-radius: 8px;
+      max-height: 260px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    /* Notification / Toast */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: var(--midnight-900);
+      color: white;
+      border: 1px solid var(--gold-primary);
+      padding: 12px 20px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+      display: none;
+      z-index: 100;
+      animation: slideUp 0.25s ease-out;
+    }
+
+    @keyframes slideUp {
+      from { transform: translateY(20px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    @media (max-width: 960px) {
+      .app-container {
+        grid-template-columns: 1fr;
+      }
+      .diagnostic-panel {
+        display: none;
+      }
+      .chat-card {
+        height: calc(100vh - 100px);
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header class="top-nav">
+    <div class="brand-group">
+      <div class="brand-crest">RA</div>
+      <div>
+        <h1 class="brand-title">The Royal Atelier</h1>
+        <p class="brand-subtitle">AI Sales Agent Testing Workbench</p>
+      </div>
+    </div>
+
+    <div class="nav-actions">
+      <button class="btn btn-outline" onclick="fetchSessionsList()">
+        🔄 Refresh Sessions
+      </button>
+      <button class="btn btn-outline" onclick="startNewSession()">
+        ✨ New Session
+      </button>
+      <button class="btn btn-danger-outline" onclick="clearCurrentSession()">
+        🗑️ Clear Active Session
+      </button>
+      <button class="btn btn-danger-outline" onclick="clearAllSessions()">
+        ⚡ Clear All (Redis & DB)
+      </button>
+    </div>
+  </header>
+
+  <!-- Main App Layout -->
+  <main class="app-container">
+    
+    <!-- Left: Chat Workbench -->
+    <section class="chat-card">
+      
+      <!-- Session Bar -->
+      <div class="session-toolbar">
+        <div class="session-switch-group">
+          <label class="field-label" for="sessionSelect">Switch Session:</label>
+          <select id="sessionSelect" class="select-input" onchange="onSessionDropdownChange()">
+            <option value="">-- Select Active Session --</option>
+          </select>
+          <button class="session-quick-btn" title="Reload History" onclick="loadSessionHistory()">
+            📥 Load
+          </button>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <label class="field-label" for="sessionIdInput">ID:</label>
+          <input id="sessionIdInput" class="text-input" style="width: 170px;" placeholder="session_..." />
+          <button class="session-quick-btn" onclick="applyManualSessionId()">Switch</button>
+        </div>
+      </div>
+
+      <!-- Messages Viewport -->
+      <div id="messagesViewport" class="messages-viewport">
+        <!-- Messages dynamically inserted here -->
+      </div>
+
+      <!-- Composer & Quick Tests -->
+      <div class="composer-section">
+        <div class="quick-prompts-bar">
+          <span class="field-label" style="margin-right: 4px;">Quick Tests:</span>
+          <button class="prompt-chip special-variation" onclick="usePrompt('Is product ki variations aur cuts kya hain?')">
+            🔍 Test Product Variations
+          </button>
+          <button class="prompt-chip" onclick="usePrompt('Mujhe Nikah ke liye cream Sherwani chahiye, options dikhao')">
+            👑 Nikah Sherwani
+          </button>
+          <button class="prompt-chip" onclick="usePrompt('Valima ke liye sharp Tuxedo ya 3-piece suit dikhao')">
+            👔 Valima Suit
+          </button>
+          <button class="prompt-chip" onclick="usePrompt('Pehli sherwani pasand hai, price thora high hai, koi discount mil sakta hai?')">
+            💰 Negotiate Discount
+          </button>
+          <button class="prompt-chip" onclick="usePrompt('Meri chest 40 aur waist 34 hai, fitting ka kya process hai?')">
+            📏 Size & Measurements
+          </button>
+          <button class="prompt-chip" onclick="usePrompt('Mujhe human consultant se baat karni hai, arrange kar dein')">
+            🤝 Human Handover
+          </button>
+        </div>
+
+        <div class="composer-input-row">
+          <textarea
+            id="messageInput"
+            class="chat-textarea"
+            placeholder="Type your test message here... (Press Enter to Send)"
+            onkeydown="handleTextareaKeyDown(event)"
+          ></textarea>
+          <button id="sendBtn" class="send-btn" onclick="sendChatMessage()">
+            Send ➔
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right: Diagnostics & State Inspector -->
+    <aside class="diagnostic-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">Turn Diagnostics</h2>
+        <span id="diagnosticStatus" style="font-size: 11px; font-weight: 700; color: var(--success);">Online</span>
+      </div>
+
+      <div class="panel-body">
+        <!-- Latest Executed Nodes -->
+        <div class="info-card">
+          <div class="info-card-header">
+            <span>Executed LangGraph Nodes</span>
+            <span id="nodesCountBadge" style="font-size: 10px; color: var(--gold-dark); font-weight: 800;">0 NODES</span>
+          </div>
+          <div id="latestNodesContainer" style="display: flex; flex-direction: column; gap: 6px;">
+            <span style="color: var(--text-muted); font-size: 12px; font-style: italic;">No turn executed yet.</span>
+          </div>
+        </div>
+
+        <!-- Funnel State Summary -->
+        <div class="info-card">
+          <div class="info-card-header">
+            <span>Funnel State</span>
+          </div>
+          <div class="kv-grid">
+            <span class="kv-key">Intent:</span>
+            <span id="diagIntent" class="kv-val">—</span>
+
+            <span class="kv-key">Sales Stage:</span>
+            <span id="diagSalesStage" class="kv-val highlight">—</span>
+
+            <span class="kv-key">Buying Intent:</span>
+            <span id="diagBuyingIntent" class="kv-val">—</span>
+
+            <span class="kv-key">Product ID:</span>
+            <span id="diagProductId" class="kv-val highlight">—</span>
+
+            <span class="kv-key">Product Type:</span>
+            <span id="diagProductType" class="kv-val">—</span>
+
+            <span class="kv-key">Color/Event:</span>
+            <span id="diagColorEvent" class="kv-val">—</span>
+          </div>
+        </div>
+
+        <!-- Raw Turn State JSON -->
+        <div class="info-card" style="flex: 1; display: flex; flex-direction: column;">
+          <div class="info-card-header">
+            <span>Last Turn State JSON</span>
+            <button class="session-quick-btn" style="padding: 2px 6px; font-size: 10px;" onclick="copyRawState()">Copy</button>
+          </div>
+          <pre id="rawStateJson" class="state-json">{}</pre>
+        </div>
+      </div>
+    </aside>
+
+  </main>
+
+  <!-- Notification Toast -->
+  <div id="toast"></div>
+
+  <script>
+    // State references
+    let currentSessionId = "";
+    let lastStatePayload = {};
+    const apiBaseUrl = window.location.origin;
+
+    const messagesViewport = document.getElementById("messagesViewport");
+    const sessionSelect = document.getElementById("sessionSelect");
+    const sessionIdInput = document.getElementById("sessionIdInput");
+    const messageInput = document.getElementById("messageInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const toastEl = document.getElementById("toast");
+
+    // Diagnostic elements
+    const diagIntent = document.getElementById("diagIntent");
+    const diagSalesStage = document.getElementById("diagSalesStage");
+    const diagBuyingIntent = document.getElementById("diagBuyingIntent");
+    const diagProductId = document.getElementById("diagProductId");
+    const diagProductType = document.getElementById("diagProductType");
+    const diagColorEvent = document.getElementById("diagColorEvent");
+    const rawStateJson = document.getElementById("rawStateJson");
+    const latestNodesContainer = document.getElementById("latestNodesContainer");
+    const nodesCountBadge = document.getElementById("nodesCountBadge");
+
+    function generateSessionId() {
+      return "royal_session_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 7);
+    }
+
+    function showToast(message, duration = 3000) {
+      toastEl.textContent = message;
+      toastEl.style.display = "block";
+      setTimeout(() => {
+        toastEl.style.display = "none";
+      }, duration);
+    }
+
+    // Initialize Workbench
+    async function initWorkbench() {
+      const savedSession = localStorage.getItem("royal_atelier_active_session");
+      currentSessionId = savedSession || generateSessionId();
+      sessionIdInput.value = currentSessionId;
+      localStorage.setItem("royal_atelier_active_session", currentSessionId);
+
+      await fetchSessionsList();
+      await loadSessionHistory();
+    }
+
+    // Fetch list of recent sessions from FastAPI
+    async function fetchSessionsList() {
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/sessions?limit=50`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const sessions = data.sessions || [];
+
+        sessionSelect.innerHTML = '<option value="">-- Select Active Session --</option>';
+        sessions.forEach(sess => {
+          const opt = document.createElement("option");
+          opt.value = sess.session_id;
+          opt.textContent = `${sess.session_id} (${sess.message_count || 0} msgs)`;
+          if (sess.session_id === currentSessionId) {
+            opt.selected = true;
+          }
+          sessionSelect.appendChild(opt);
+        });
+      } catch (err) {
+        console.warn("Could not fetch sessions list:", err);
+      }
+    }
+
+    function onSessionDropdownChange() {
+      const selected = sessionSelect.value;
+      if (selected) {
+        switchSession(selected);
+      }
+    }
+
+    function applyManualSessionId() {
+      const manualId = sessionIdInput.value.trim();
+      if (manualId) {
+        switchSession(manualId);
+      }
+    }
+
+    function switchSession(newSessionId) {
+      currentSessionId = newSessionId;
+      sessionIdInput.value = currentSessionId;
+      sessionSelect.value = currentSessionId;
+      localStorage.setItem("royal_atelier_active_session", currentSessionId);
+      loadSessionHistory();
+      showToast(`Switched to session: ${currentSessionId}`);
+    }
+
+    function startNewSession() {
+      const newId = generateSessionId();
+      switchSession(newId);
+    }
+
+    // Load messages from PostgreSQL
+    async function loadSessionHistory() {
+      messagesViewport.innerHTML = "";
+      if (!currentSessionId) return;
+
+      try {
+        const res = await fetch(`${apiBaseUrl}/sessions/${currentSessionId}/messages?limit=50`);
+        if (!res.ok) throw new Error(`Failed to load messages: ${res.statusText}`);
+        const data = await res.json();
+        const messages = data.messages || [];
+
+        if (messages.length === 0) {
+          renderSystemWelcome();
+        } else {
+          messages.forEach(msg => {
+            renderMessage(msg.role, msg.content, msg.metadata || {});
+          });
+        }
+      } catch (err) {
+        console.error("Error loading session history:", err);
+        renderSystemWelcome();
+      }
+    }
+
+    function renderSystemWelcome() {
+      renderMessage(
+        "assistant",
+        "Assalam-o-Alaikum wa Rahmatullah! Welcome to The Royal Atelier.\n\nI am your bespoke sales assistant. You can test product discovery, ask about specific product variations, test price negotiations, or sizing.",
+        { executed_nodes: ["system_welcome"] }
+      );
+    }
+
+    // Render a chat message
+    function renderMessage(role, content, metadata = {}) {
+      const row = document.createElement("div");
+      row.className = `message-row ${role}`;
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "bubble-wrapper";
+
+      const sender = document.createElement("div");
+      sender.className = "message-sender";
+      sender.innerHTML = role === "user" 
+        ? `<span>Customer</span> 👤` 
+        : `👑 <span>Royal Atelier Stylist</span>`;
+      wrapper.appendChild(sender);
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = content;
+      wrapper.appendChild(bubble);
+
+      // Render product image if available
+      const imageUrl = metadata.imageurl || metadata.product_image_url;
+      if (imageUrl && role === "assistant") {
+        const imgCard = document.createElement("div");
+        imgCard.className = "bubble-image-container";
+        imgCard.innerHTML = `
+          <img src="${imageUrl}" class="bubble-image" alt="Piece Preview" loading="lazy" />
+          <div class="bubble-image-caption">
+            <span>Royal Atelier Collection</span>
+            <a href="${imageUrl}" target="_blank" style="color: var(--gold-dark); text-decoration: none; font-weight: 700;">Full View ↗</a>
+          </div>
+        `;
+        wrapper.appendChild(imgCard);
+      }
+
+      // Render Node Execution Trace for Assistant
+      const executedNodes = metadata.executed_nodes || [];
+      if (role === "assistant" && executedNodes.length > 0) {
+        const traceStrip = document.createElement("div");
+        traceStrip.className = "node-trace-strip";
+        
+        let pillsHtml = `<span class="trace-title">🔄 Nodes Called:</span>`;
+        executedNodes.forEach((node, idx) => {
+          let nodeClass = "node-pill";
+          if (node === "planner") nodeClass += " planner";
+          else if (node.includes("product")) nodeClass += " products";
+          else if (node.includes("negotiat")) nodeClass += " negotiation";
+          else if (node === "final_response") nodeClass += " final_response";
+
+          pillsHtml += `<span class="${nodeClass}">${getNodeIcon(node)} ${node}</span>`;
+          if (idx < executedNodes.length - 1) {
+            pillsHtml += `<span class="node-arrow">➔</span>`;
+          }
+        });
+
+        traceStrip.innerHTML = pillsHtml;
+        wrapper.appendChild(traceStrip);
+      }
+
+      row.appendChild(wrapper);
+      messagesViewport.appendChild(row);
+      messagesViewport.scrollTop = messagesViewport.scrollHeight;
+    }
+
+    function getNodeIcon(nodeName) {
+      if (nodeName === "planner") return "🧠";
+      if (nodeName.includes("search_products")) return "🔍";
+      if (nodeName.includes("get_product_details")) return "🏷️";
+      if (nodeName.includes("inventory")) return "📦";
+      if (nodeName.includes("negotiat")) return "💰";
+      if (nodeName.includes("cross_sell")) return "👔";
+      if (nodeName.includes("fabric")) return "🧵";
+      if (nodeName.includes("measurement")) return "📏";
+      if (nodeName.includes("handover")) return "🤝";
+      if (nodeName === "final_response") return "✨";
+      return "⚙️";
+    }
+
+    // Send chat message
+    async function sendChatMessage() {
+      const message = messageInput.value.trim();
+      if (!message) return;
+
+      renderMessage("user", message);
+      messageInput.value = "";
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch(`${apiBaseUrl}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: currentSessionId,
+            message: message
+          })
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || `Server error: ${res.status}`);
+        }
+
+        const data = await res.json();
+        const executedNodes = data.executed_nodes || (data.state && data.state.executed_nodes) || [];
+
+        renderMessage("assistant", data.reply, {
+          executed_nodes: executedNodes,
+          imageurl: data.imageurl
+        });
+
+        updateDiagnosticPanel(data, executedNodes);
+        fetchSessionsList(); // update counts
+      } catch (err) {
+        console.error("Chat error:", err);
+        renderMessage("assistant", `⚠️ Error: ${err.message}`, {});
+        showToast("Error communicating with /chat API", 4000);
+      } finally {
+        sendBtn.disabled = false;
+        messageInput.focus();
+      }
+    }
+
+    // Update Diagnostics
+    function updateDiagnosticPanel(data, executedNodes) {
+      const state = data.state || {};
+      lastStatePayload = data;
+
+      diagIntent.textContent = state.intent || "—";
+      diagSalesStage.textContent = state.sales_stage || "—";
+      diagBuyingIntent.textContent = state.buying_intent || "—";
+      diagProductId.textContent = state.selected_product_id || "None";
+      diagProductType.textContent = state.product_type || "—";
+      diagColorEvent.textContent = `${state.color || 'Any'} / ${state.event_type || 'Any'}`;
+
+      rawStateJson.textContent = JSON.stringify(data, null, 2);
+
+      // Update nodes badge & list
+      nodesCountBadge.textContent = `${executedNodes.length} NODES`;
+      if (executedNodes.length === 0) {
+        latestNodesContainer.innerHTML = `<span style="color: var(--text-muted); font-size: 12px; font-style: italic;">No nodes recorded.</span>`;
+      } else {
+        latestNodesContainer.innerHTML = executedNodes.map((n, i) => `
+          <div style="display: flex; align-items: center; justify-content: space-between; font-size: 12px; background: white; padding: 5px 8px; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <span style="font-weight: 700; color: var(--midnight-800);">${i+1}. ${getNodeIcon(n)} ${n}</span>
+            <span style="font-size: 10px; color: var(--text-muted);">Step ${i+1}</span>
+          </div>
+        `).join("");
+      }
+    }
+
+    function copyRawState() {
+      navigator.clipboard.writeText(JSON.stringify(lastStatePayload, null, 2));
+      showToast("State JSON copied to clipboard!");
+    }
+
+    function usePrompt(text) {
+      messageInput.value = text;
+      messageInput.focus();
+    }
+
+    function handleTextareaKeyDown(e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    }
+
+    // Endpoint 1: Clear current session from Redis + DB
+    async function clearCurrentSession() {
+      if (!currentSessionId) return;
+      if (!confirm(`Are you sure you want to clear session '${currentSessionId}' from Redis and PostgreSQL?`)) return;
+
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/sessions/${currentSessionId}/clear`, {
+          method: "POST"
+        });
+        const data = await res.json();
+        showToast(data.message || `Session ${currentSessionId} cleared!`);
+        messagesViewport.innerHTML = "";
+        renderSystemWelcome();
+        fetchSessionsList();
+      } catch (err) {
+        alert("Failed to clear session: " + err.message);
+      }
+    }
+
+    // Endpoint 2: Clear ALL sessions from Redis + DB
+    async function clearAllSessions() {
+      if (!confirm("⚠️ WARNING: This will flush ALL Redis sessions, local memory cache, and PostgreSQL conversation records. Continue?")) return;
+
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/sessions/clear-all`, {
+          method: "POST"
+        });
+        const data = await res.json();
+        showToast("All Redis sessions and DB chat history have been cleared!");
+        startNewSession();
+        fetchSessionsList();
+      } catch (err) {
+        alert("Failed to clear all sessions: " + err.message);
+      }
+    }
+
+    initWorkbench();
+  </script>
+</body>
+</html>
