@@ -57,7 +57,8 @@ async def suggest_cross_sell(
             raw,
             product_category=product_type,
             event_type=str(occasion) if occasion else None,
-            limit=6,
+            product_color=color,
+            limit=1,
         )
         if not filtered:
             searched = await backend_api.search_accessories(
@@ -72,7 +73,8 @@ async def suggest_cross_sell(
                 searched,
                 product_category=product_type,
                 event_type=str(occasion) if occasion else None,
-                limit=6,
+                product_color=color,
+                limit=1,
             )
 
         results = summarize_accessories_for_prompt(filtered)

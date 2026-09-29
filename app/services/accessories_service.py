@@ -74,20 +74,18 @@ def event_matches_suitable(event_type: str | None, suitable_events: list[Any] | 
 
 
 # Color families for matching
-_NEUTRAL_COLORS = {"black", "charcoal", "grey", "gray", "dark"}
+_NEUTRAL_COLORS = {"black", "charcoal", "grey", "gray"}
+# Palette words from discovery ("dark shades") — not a specific garment colour.
+_PALETTE_TONES = {"light", "dark", "soft"}
 _COMPLEMENTARY_PAIRS = {
-    # Gold/Golden complements Navy/Blue/Dark
-    "gold": {"navy", "blue", "darkblue", "dark", "black", "maroon"},
-    "golden": {"navy", "blue", "darkblue", "dark", "black", "maroon"},
+    # Gold/Golden complements Navy/Blue/Black/Maroon — never white-on-black.
+    "gold": {"navy", "blue", "darkblue", "black", "maroon", "burgundy"},
+    "golden": {"navy", "blue", "darkblue", "black", "maroon", "burgundy"},
     # Silver complements Black/Grey/Navy
-    "silver": {"black", "grey", "gray", "charcoal", "navy", "dark"},
-    # Maroon complements Gold/Cream/Ivory
-    "maroon": {"gold", "golden", "cream", "ivory", "beige", "white"},
-    "burgundy": {"gold", "golden", "cream", "ivory", "beige"},
-    # White/Ivory complements Dark colors
-    "white": {"black", "navy", "maroon", "dark", "charcoal"},
-    "ivory": {"black", "navy", "maroon", "dark", "charcoal", "burgundy"},
-    "cream": {"black", "navy", "maroon", "dark", "burgundy"},
+    "silver": {"black", "grey", "gray", "charcoal", "navy"},
+    # Maroon complements Gold (not a white shawl on a dark sherwani)
+    "maroon": {"gold", "golden", "navy", "black"},
+    "burgundy": {"gold", "golden", "navy", "black"},
 }
 
 
@@ -96,6 +94,54 @@ def _normalize_color(color: str | None) -> str:
     if not color:
         return ""
     return re.sub(r"[^a-z]+", "", color.strip().lower())
+
+
+def is_specific_garment_color(color: str | None) -> bool:
+    """True when the value is a real colour, not a Light/Dark palette preference."""
+    norm = _normalize_color(color)
+    return bool(norm) and norm not in _PALETTE_TONES
+
+
+def resolve_garment_color_for_accessory(
+    session_color: str | None,
+    available_colors: list[Any] | None,
+) -> tuple[str | None, list[str], bool]:
+    """
+    Pick the garment colour used for accessory matching.
+
+    Returns (resolved_color, available_colors, color_pending).
+    color_pending is True when the piece has multiple colours and the shopper
+    has not chosen one yet — ask before offering a gift.
+    """
+    available = [str(c).strip() for c in (available_colors or []) if str(c).strip()]
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_available: list[str] = []
+    for label in available:
+        key = _normalize_color(label)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_available.append(label)
+
+    if is_specific_garment_color(session_color):
+        sess_norm = _normalize_color(session_color)
+        for label in unique_available:
+            lab_norm = _normalize_color(label)
+            if sess_norm == lab_norm or sess_norm in lab_norm or lab_norm in sess_norm:
+                return label, unique_available, False
+        # Named a specific colour even if it is not in the list (e.g. "black")
+        if not unique_available:
+            return str(session_color).strip(), unique_available, False
+        # Specific colour that is not one of this SKU's options — still use it
+        # for matching, but do not re-ask.
+        return str(session_color).strip(), unique_available, False
+
+    if len(unique_available) == 1:
+        return unique_available[0], unique_available, False
+    if len(unique_available) > 1:
+        return None, unique_available, True
+    return None, unique_available, False
 
 
 def color_matches_product(
@@ -250,12 +296,13 @@ def filter_accessories_for_product(
                 price = 0.0
             if price <= 0 or price > float(max_price):
                 continue
-        # Color matching: filter out non-matching colors when product_color is set
-        if product_color:
+        # Color matching: filter out clashing colours when a specific garment colour is set
+        if product_color and is_specific_garment_color(product_color):
             acc_colors = item.get("available_colors") or []
             matches, score = color_matches_product(acc_colors, product_color)
             if not matches:
                 continue
+            item = dict(item)
             item["_color_score"] = score  # Temporary field for sorting
         filtered.append(item)
 
@@ -281,7 +328,7 @@ def filter_accessories_for_product(
             ]
 
     # Prefer better color matches, then cheaper within margin
-    if product_color:
+    if product_color and is_specific_garment_color(product_color):
         # Sort by color score descending (3=exact, 2=complement, 1=neutral), then by price
         filtered.sort(
             key=lambda a: (-a.get("_color_score", 0), float(a.get("price") or 0))

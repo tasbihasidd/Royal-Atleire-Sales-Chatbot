@@ -42,6 +42,9 @@ class NegotiationEngine:
         bundle_offer: dict[str, Any] | None = None,
         currency: str | None = None,
         margin_budget: float | None = None,
+        product_color: str | None = None,
+        product_colors: list[str] | None = None,
+        color_pending: bool = False,
     ) -> tuple[NegotiationStateSchema, dict[str, Any]]:
         state = current_state.model_copy(deep=True)
         floor = resolve_floor_price(list_price, floor_price_override)
@@ -61,13 +64,18 @@ class NegotiationEngine:
         if customer_offered_price is not None:
             state.customer_target_price = customer_offered_price
 
-        accessory_rows = accessories or []
+        accessory_rows = list(accessories or [])[:1]
+        color_options = [str(c).strip() for c in (product_colors or []) if str(c).strip()]
+        colors_bit = ", ".join(color_options[:8]) if color_options else ""
+        # Do not gift until a specific garment colour is known (when the SKU has options).
+        if color_pending and round_num >= 2:
+            accessory_rows = []
         free_ok = qualifies_for_free_accessory(
             list_price,
             currency=currency,
             bundle_offer=bundle_offer,
         )
-        can_gift = bool(free_ok and accessory_rows and headroom > 0)
+        can_gift = bool(free_ok and accessory_rows and headroom > 0 and not color_pending)
 
         if round_num == 1:
             state.last_offered_price = list_price
@@ -105,16 +113,37 @@ class NegotiationEngine:
             state.offered_bundles = names
 
             threshold_label = "100,000" if currency_label not in ("GBP", "USD", "EUR") else "£1,000"
-            if can_gift:
-                names_bit = ", ".join(names[:4])
+            if color_pending:
+                color_ask = (
+                    f" from this piece's available colours only: {colors_bit}"
+                    if colors_bit
+                    else ""
+                )
+                directive = (
+                    f"Maintain list price ({int(list_price):,} {currency_label}). "
+                    "Do NOT offer a complimentary accessory, bundle, or gift yet. "
+                    f"Ask which colour they want{color_ask}. "
+                    "After they pick a colour we will match ONE accessory to that colour. "
+                    "Do not invent colours that are not listed. "
+                    f"{_NEVER_CASH} "
+                    f"{_NEVER_INTERNAL_LEAK}"
+                )
+                action = "ask_color_preference"
+            elif can_gift:
+                names_bit = names[0] if names else ""
+                match_bit = (
+                    f" It must colour-match the chosen garment colour ({product_color})."
+                    if product_color
+                    else ""
+                )
                 directive = (
                     f"Maintain list price ({int(list_price):,} {currency_label}). "
                     "This order qualifies for ONE complimentary (FREE) matching accessory from "
-                    f"negotiation_result.accessories only: {names_bit}. "
-                    "MUST name ONE accessory and its catalogue price in THIS reply and say it is "
+                    f"negotiation_result.accessories only: {names_bit}.{match_bit} "
+                    "MUST name that ONE accessory and its catalogue price in THIS reply and say it is "
                     "completely complimentary/free with this piece — do NOT bounce to Style Consultant first "
                     "when accessories are listed. Do NOT invent items or offer anything not in "
-                    "negotiation_result.accessories. "
+                    "negotiation_result.accessories. Do NOT offer a second accessory. "
                     "Also mention custom lighter-work (halka kaam) of THIS piece via Style Consultant "
                     "if they need a lower cash price. "
                     f"{_NEVER_CASH} "
@@ -122,10 +151,10 @@ class NegotiationEngine:
                 )
                 action = "offer_free_accessory"
             elif accessory_rows and not free_ok:
-                names_bit = ", ".join(names[:4])
+                names_bit = names[0] if names else ""
                 directive = (
                     f"Maintain list price ({int(list_price):,} {currency_label}). No free accessory "
-                    f"(order is not above {threshold_label}). You may mention paid matching add-ons from "
+                    f"(order is not above {threshold_label}). You may mention ONE paid matching add-on from "
                     f"negotiation_result.accessories only ({names_bit}) — do not invent. "
                     f"Also mention custom lighter-work of THIS piece via consultant. {_NEVER_CASH} "
                     f"{_NEVER_INTERNAL_LEAK}"
@@ -175,16 +204,36 @@ class NegotiationEngine:
                 if a
             ]
             names = [n for n in names if n]
-            if can_gift:
-                names_bit = ", ".join(names[:4])
+            if color_pending:
+                color_ask = (
+                    f" from this piece's available colours only: {colors_bit}"
+                    if colors_bit
+                    else ""
+                )
                 directive = (
                     f"Customer is still negotiating — hold firm at list price ({int(list_price):,} {currency_label}). "
-                    f"MUST re-offer ONE complimentary accessory by name from negotiation_result.accessories only: {names_bit}. "
+                    "Do NOT offer a complimentary accessory yet. "
+                    f"Ask which colour they want{color_ask} so we can match ONE accessory. "
+                    f"{_NEVER_CASH} "
+                    f"{_NEVER_INTERNAL_LEAK}"
+                )
+                action = "ask_color_preference"
+            elif can_gift:
+                names_bit = names[0] if names else ""
+                match_bit = (
+                    f" Colour-match it to {product_color}."
+                    if product_color
+                    else ""
+                )
+                directive = (
+                    f"Customer is still negotiating — hold firm at list price ({int(list_price):,} {currency_label}). "
+                    f"MUST re-offer ONE complimentary accessory by name from negotiation_result.accessories only: {names_bit}.{match_bit} "
                     "Do NOT bounce to Style Consultant first when accessories are listed. "
                     "This is our value-add; there is no lower cash price on this piece. "
                     f"{_NEVER_CASH} Mention Style Consultant or custom lighter-work only if they need a lower total. "
                     f"{_NEVER_INTERNAL_LEAK}"
                 )
+                action = "reinforce_gift_or_consultant"
             else:
                 directive = (
                     f"Customer is still negotiating — hold firm at list price ({int(list_price):,} {currency_label}). "
@@ -193,9 +242,10 @@ class NegotiationEngine:
                     f"or paid add-ons from tools only. {_NEVER_CASH} "
                     f"{_NEVER_INTERNAL_LEAK}"
                 )
+                action = "reinforce_gift_or_consultant"
             strategy = {
                 "round": 3,
-                "action": "reinforce_gift_or_consultant",
+                "action": action,
                 "offered_price": list_price,
                 "discount_percent": 0.0,
                 "is_final_offer": True,

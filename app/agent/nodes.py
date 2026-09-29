@@ -47,6 +47,7 @@ from app.services.accessories_service import (
     filter_free_gift_candidates,
     free_gift_margin_budget,
     qualifies_for_free_accessory,
+    resolve_garment_color_for_accessory,
     summarize_accessories_for_prompt,
 )
 from app.services.currency_service import apply_display_currency_list
@@ -1939,6 +1940,7 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     )
     profile.buying_intent = buying_intent  # type: ignore[assignment]
 
+    session_products = list(state.get("products") or [])
     sales_stage = plan.get("sales_stage") or profile.sales_stage or "discovery"
     if objection_type:
         sales_stage = "objection" if objection_type != "price" else "negotiation"
@@ -1963,6 +1965,28 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         sales_stage = "negotiation"
         # CRITICAL: Clear products list — negotiation conversations should focus on selected product only, no carousel
         session_products = []
+
+    # After we asked for a colour to match an accessory, a colour reply continues negotiation.
+    prev_neg = state.get("negotiation_result") if isinstance(state.get("negotiation_result"), dict) else {}
+    prev_neg_action = str(
+        prev_neg.get("action")
+        or (prev_neg.get("strategy") or {}).get("action")
+        or ""
+    ).lower()
+    named_color_now = _extract_explicit_color(user_message)
+    if (
+        prev_neg_action == "ask_color_preference"
+        and (state.get("selected_product_id") or plan.get("selected_product_id"))
+        and named_color_now
+        and "create_human_handover" not in required_steps
+    ):
+        if "calculate_negotiation_offer" not in required_steps:
+            required_steps = list(dict.fromkeys([*required_steps, "calculate_negotiation_offer"]))
+        intent = "discount_request" if intent == "general" else intent
+        sales_stage = "negotiation"
+        session_products = []
+        if not plan.get("color"):
+            plan["color"] = named_color_now
 
     # CRITICAL GUARD: Negotiation / discount is ONLY valid when a product is actually selected!
     # If no product is selected yet, price-conscious phrases ("normal batao", "zada expensive nhi", "sasta") are budget guidance for search.
@@ -2143,7 +2167,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     # Matching pool = current + history; response products stay current turn only
     # (search_products overwrites when it runs).
     known_products = _collect_known_products(state)
-    session_products = list(state.get("products") or [])
+    if sales_stage != "negotiation":
+        session_products = list(state.get("products") or [])
     confirm_color = plan.get("color") or stated_color
     product_details_state = state.get("product_details") if isinstance(state.get("product_details"), dict) else {}
     if isinstance(product_details_state, dict) and product_details_state.get("error"):
@@ -3734,15 +3759,27 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
         state.get("catalog_categories") or [],
     ) or product_category
     event_type = state.get("event_type")
-    
-    # Get user's selected color for accessory matching
-    product_color = state.get("color") or state.get("selected_color")
+
+    product_available_colors = [
+        str(c).strip()
+        for c in (details.get("available_colors") or [])
+        if str(c).strip()
+    ]
+    session_color = state.get("color") or state.get("selected_color") or _extract_explicit_color(
+        state.get("user_message") or ""
+    )
+    product_color, product_available_colors, color_pending = resolve_garment_color_for_accessory(
+        session_color,
+        product_available_colors,
+    )
+    next_round = int((state.get("negotiation_state") or {}).get("round_number") or 0) + 1
+    # Round 1 is value defence — colour ask only starts when we would gift (round 2+).
+    ask_color_before_gift = bool(color_pending and next_round >= 2)
 
     accessory_rows: list[dict[str, Any]] = []
     bundle_offer: dict[str, Any] | None = None
     # Prefetch matching accessories for Round 2 (and later rounds reuse in result).
-    next_round = int((state.get("negotiation_state") or {}).get("round_number") or 0) + 1
-    if product_category and next_round >= 2:
+    if product_category and next_round >= 2 and not ask_color_before_gift:
         try:
             recommended = await backend_api.recommend_accessories(
                 category=str(product_category),
@@ -3900,6 +3937,9 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
         bundle_offer=bundle_offer,
         currency=details.get("currency") or "PKR",
         margin_budget=margin_budget,
+        product_color=product_color,
+        product_colors=product_available_colors,
+        color_pending=ask_color_before_gift,
     )
 
     alternative_products: list[dict[str, Any]] = []
@@ -3950,10 +3990,19 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
             accessories_for_display.append(acc)
         elif isinstance(acc, dict):
             name = acc.get("name") or acc.get("accessory_type") or "Accessory"
-            accessories_for_display.append(str(name))
+            acc_colors = [str(c) for c in (acc.get("available_colors") or []) if str(c).strip()]
+            if product_color and acc_colors:
+                accessories_for_display.append(f"{name} ({product_color})")
+            else:
+                accessories_for_display.append(str(name))
     
     result = {
-        "approved": action not in ("cutoff_and_pivot", "budget_pivot", "defend_value"),
+        "approved": action not in (
+            "cutoff_and_pivot",
+            "budget_pivot",
+            "defend_value",
+            "ask_color_preference",
+        ),
         "cash_discount_offered": False,
         "round_number": updated_neg_state.round_number,
         "strategy": strategy,
@@ -3988,12 +4037,15 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
         strategy.get("offered_price"),
         len(alternative_products),
     )
-    return {
+    out: dict[str, Any] = {
         "negotiation_result": result,
         "negotiation_state": updated_neg_state.model_dump(),
         "sales_stage": "negotiation",
         "products": alternative_products or [],
     }
+    if product_color:
+        out["color"] = product_color
+    return out
 
 
 
