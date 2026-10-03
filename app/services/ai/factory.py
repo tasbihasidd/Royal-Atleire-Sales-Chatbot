@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from app.config import settings
 from app.services.ai.base import AIProvider
 from app.services.ai.deepseek import DeepSeekProvider
+from app.services.ai.fal import FalProvider
 from app.services.ai.openrouter import OpenRouterProvider
 
 
@@ -112,6 +113,8 @@ class AIProviderFactory:
         provider_name = str(raw).strip().lower()
         if not provider_name or provider_name in ("none", "off", "disabled"):
             return None
+        if provider_name == "fal":
+            return FalProvider()
         if provider_name in ("openrouter", "fireworks"):
             return OpenRouterProvider(profile=provider_name)
         if provider_name == "deepseek":
@@ -120,5 +123,5 @@ class AIProviderFactory:
             return _LegacyOpenAICompatibleProvider(provider_name)
         raise ValueError(
             f"Unsupported LLM_PROVIDER={provider_name!r}. "
-            "Use openrouter, fireworks, deepseek, openai, groq, anthropic, or none."
+            "Use fal, openrouter, fireworks, deepseek, openai, groq, anthropic, or none."
         )

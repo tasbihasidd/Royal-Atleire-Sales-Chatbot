@@ -21,7 +21,7 @@ def build_chat_model(**kwargs: Any):
     if provider is None:
         raise RuntimeError(
             "LLM_PROVIDER is none/empty — no chat model available. "
-            "Set LLM_PROVIDER=openrouter|fireworks|deepseek|openai|groq|anthropic."
+            "Set LLM_PROVIDER=fal and FAL_KEY in .env."
         )
     return provider.chat_model(**kwargs)
 

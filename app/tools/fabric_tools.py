@@ -18,12 +18,12 @@ async def search_fabrics(
     season: str | None = None,
     pattern: str | None = None,
     embroidery: str | None = None,
-    limit: int = 10,
+    limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """
     Search fabrics for custom / bespoke orders.
-    Returns catalog_code, name, colours, season, embroidery, etc.
+    Returns the full API page (frontend applies display limits).
     Never invent fabric price, meters, or weight — those are not in the fabric schema.
     """
     logger.info(

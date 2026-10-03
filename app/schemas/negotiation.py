@@ -11,6 +11,7 @@ class NegotiationStateSchema(BaseModel):
     customer_target_price: float | None = None
     last_offered_price: float | None = None
     offered_bundles: list[str] = Field(default_factory=list)  # ["matching gold stole", "khussa"]
+    last_action: str | None = None  # persist across turns (e.g. ask_color_preference)
     
     is_floor_reached: bool = False
     is_closed: bool = False

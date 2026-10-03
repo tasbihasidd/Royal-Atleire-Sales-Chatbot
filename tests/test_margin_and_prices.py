@@ -5,6 +5,7 @@ from app.schemas.negotiation import NegotiationStateSchema
 from app.services.accessories_service import (
     filter_free_gift_candidates,
     free_gift_margin_budget,
+    qualifies_for_free_accessory,
 )
 from app.services.backend_api import _normalize_product
 from app.services.currency_service import apply_display_currency
@@ -15,6 +16,18 @@ def test_margin_budget_list_minus_floor():
     assert free_gift_margin_budget(150_000, 120_000) == 30_000
     assert free_gift_margin_budget(150_000, 120_000, {"max_free_value": 25_000}) == 25_000
     assert free_gift_margin_budget(100_000, 100_000) == 0
+
+
+def test_gbp_bundle_offer_threshold_350():
+    """GBP/USD/EUR products at or above £350 qualify for complimentary bundle."""
+    assert qualifies_for_free_accessory(349, currency="GBP") is False
+    assert qualifies_for_free_accessory(350, currency="GBP") is True
+    assert qualifies_for_free_accessory(400, currency="GBP") is True
+    assert qualifies_for_free_accessory(349, currency="USD") is False
+    assert qualifies_for_free_accessory(350, currency="EUR") is True
+    # PKR still uses 100k tier
+    assert qualifies_for_free_accessory(99_000, currency="PKR") is False
+    assert qualifies_for_free_accessory(100_000, currency="PKR") is True
 
 
 def test_filter_free_gift_respects_margin():

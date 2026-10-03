@@ -23,6 +23,7 @@ from app.core.logging_config import (
     setup_logging,
 )
 from app.routes.image_generation import router as image_generation_router
+from app.routes.virtual_tryon import router as virtual_tryon_router
 from app.services.chat_store import chat_store
 from app.services.memory_service import memory_service
 from app.schemas.profile import CustomerProfileSchema
@@ -119,6 +120,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 app.include_router(image_generation_router)
+app.include_router(virtual_tryon_router)
 
 
 class ChatRequest(BaseModel):
@@ -136,6 +138,33 @@ class ChatResponse(BaseModel):
 def _resolve_chat_image_url(result: dict[str, Any]) -> str:
     # Do not attach leftover catalog images on greeting / off-topic / general turns, or when gathering customization preferences without a bespoke image.
     steps = result.get("required_steps") or []
+    executed = result.get("executed_nodes") or []
+    user_msg = str(result.get("user_message") or "").lower()
+
+    # Price / lead-time / pure checkout follow-ups: do NOT re-flash the bespoke card
+    # unless we generated a new image this turn.
+    price_followup = any(
+        w in user_msg
+        for w in (
+            "price",
+            "qeemat",
+            "qemat",
+            "kitna",
+            "kitne",
+            "cost",
+            "rate",
+            "pricing",
+            "lead time",
+            "kitni",
+            "paisa",
+            "amount",
+        )
+    )
+    checkout_followup = bool(result.get("checkout_url") or result.get("checkout_hand_off_note"))
+    regenerated = "generate_custom_design" in executed
+    if (price_followup or checkout_followup) and not regenerated:
+        return ""
+
     if result.get("sales_stage") == "customization" and not result.get("custom_image_url"):
         return ""
 
@@ -178,6 +207,8 @@ def root():
         "message": "Royal Atelier API is running",
         "chat_api": "/chat",
         "image_generation_api": "/api/generate-wedding-image",
+        "wedding_image_fabrics": "/api/generate-wedding-image/fabrics?category=Sherwani",
+        "virtual_tryon_api": "/api/virtual-try-on",
         "health": "/health",
     }
 
@@ -255,9 +286,20 @@ async def chat(request: ChatRequest):
             "custom_image_url": session_context.get("custom_image_url"),
             "custom_design_result": session_context.get("custom_design_result"),
             "custom_instructions": session_context.get("custom_instructions"),
+            "price_quote": session_context.get("price_quote"),
+            "customize_pricing_mode": session_context.get("customize_pricing_mode"),
             "sales_stage": profile.sales_stage or session_context.get("sales_stage"),
             "buying_intent": profile.buying_intent or session_context.get("buying_intent"),
             "customer_profile": profile.model_dump(),
+            "selected_variation_id": session_context.get("selected_variation_id")
+            or profile.selected_variation_id,
+            "selected_variation_name": session_context.get("selected_variation_name")
+            or profile.selected_variation_name,
+            "selected_product_variation_id": session_context.get("selected_product_variation_id")
+            or profile.selected_product_variation_id,
+            "selected_product_variation_name": session_context.get("selected_product_variation_name")
+            or profile.selected_product_variation_name,
+            "product_variations": session_context.get("product_variations") or [],
             "negotiation_state": negotiation_state.model_dump()
             if not session_context.get("negotiation_state")
             else session_context.get("negotiation_state"),
@@ -268,6 +310,8 @@ async def chat(request: ChatRequest):
             "customer_contact": customer_contact,
             "handover_result": None,
             "executed_nodes": [],
+            "checkout_url": session_context.get("checkout_url"),
+            "checkout_session_id": session_context.get("checkout_session_id"),
             "shown_product_ids": session_context.get("shown_product_ids") or [],
         }
 
@@ -340,9 +384,13 @@ async def chat(request: ChatRequest):
                 "negotiation_state": result.get("negotiation_state"),
                 "selected_fabric_catalog_code": result.get("selected_fabric_catalog_code"),
                 "fabrics": result.get("fabrics"),
+                "price_quote": result.get("price_quote"),
+                "customize_pricing_mode": result.get("customize_pricing_mode"),
                 "catalog_categories": result.get("catalog_categories"),
                 "scoring_reasons": result.get("scoring_reasons"),
                 "shown_product_ids": result.get("shown_product_ids") or session_context.get("shown_product_ids") or [],
+                "checkout_url": result.get("checkout_url"),
+                "checkout_session_id": result.get("checkout_session_id"),
             },
         )
 
@@ -368,6 +416,7 @@ async def chat(request: ChatRequest):
             ("selected_product_variation_id", "selected_product_variation_id"),
             ("selected_product_variation_name", "selected_product_variation_name"),
             ("product_type", "product_type"),
+            ("selected_product_id", "selected_product_id"),
         ]:
             if result.get(field) and not profile_data.get(key):
                 profile_data[key] = result.get(field)
@@ -385,6 +434,19 @@ async def chat(request: ChatRequest):
             bool(imageurl),
         )
 
+        suppress_ui = bool(result.get("suppress_product_ui")) or (
+            result.get("sales_stage") in ("detail", "closing")
+            and "search_products" not in executed_nodes
+            and "get_product_details" not in executed_nodes
+            and bool(result.get("selected_product_id"))
+            and result.get("intent") not in ("product_search", "accessories_search")
+        )
+        hide_catalog = bool(
+            result.get("custom_design_result")
+            or result.get("custom_image_url")
+            or result.get("sales_stage") == "customization"
+            or suppress_ui
+        )
         return ChatResponse(
             reply=reply,
             imageurl=imageurl,
@@ -395,9 +457,15 @@ async def chat(request: ChatRequest):
                 "discovery_next_slot": result.get("discovery_next_slot"),
                 "required_steps": result.get("required_steps"),
                 "executed_nodes": executed_nodes,
+                "buying_intent": result.get("buying_intent"),
                 "selected_product_id": result.get("selected_product_id"),
-                "products": [] if (result.get("custom_design_result") or result.get("custom_image_url") or result.get("sales_stage") == "customization") else result.get("products", []),
-                "product_details": None if (result.get("custom_design_result") or result.get("custom_image_url") or result.get("sales_stage") == "customization") else result.get("product_details"),
+                "products": [] if hide_catalog else result.get("products", []),
+                "product_details": None if hide_catalog else result.get("product_details"),
+                "suppress_product_ui": hide_catalog,
+                "checkout_hand_off_note": result.get("checkout_hand_off_note"),
+                "checkout_url": result.get("checkout_url") or session_context.get("checkout_url"),
+                "checkout_session_id": result.get("checkout_session_id") or session_context.get("checkout_session_id"),
+                "product_interest_note": result.get("product_interest_note"),
                 "inventory_result": result.get("inventory_result"),
                 "negotiation_result": result.get("negotiation_result"),
                 "measurement_result": result.get("measurement_result"),
@@ -421,6 +489,10 @@ async def chat(request: ChatRequest):
                 "category_variations": result.get("category_variations") or [],
                 "catalog_search_note": result.get("catalog_search_note"),
                 "shown_product_ids": result.get("shown_product_ids") or session_context.get("shown_product_ids") or [],
+                "fabrics": result.get("fabrics") or [],
+                "selected_fabric_catalog_code": result.get("selected_fabric_catalog_code"),
+                "customization_stage": result.get("customization_stage"),
+                "cut_style": result.get("cut_style"),
             },
         )
     except BackendAPIError as exc:

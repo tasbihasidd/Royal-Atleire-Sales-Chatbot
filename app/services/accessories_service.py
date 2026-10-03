@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 FREE_ACCESSORY_TIER_PREMIUM = 150_000.0  # Stole / Turban eligible
 FREE_ACCESSORY_TIER_STANDARD = 100_000.0  # Khussa / Brooch eligible
 FREE_ACCESSORY_TIER_DISCOUNT = 50_000.0  # 50% off accessories (paid), not free
-FREE_ACCESSORY_FOREIGN_THRESHOLD = 1_000.0
+# GBP / USD / EUR: product at or above this → complimentary bundle / free accessory eligible
+FREE_ACCESSORY_FOREIGN_THRESHOLD = 350.0
 
 # Legacy aliases used by older call sites
 FREE_ACCESSORY_PRICE_THRESHOLD = FREE_ACCESSORY_TIER_STANDARD

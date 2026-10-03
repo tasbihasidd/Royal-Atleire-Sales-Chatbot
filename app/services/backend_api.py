@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.core.payload_log import print_payload
 from app.schemas.fabric import FabricSchema
 from app.schemas.product import ProductSchema
 from app.services.negotiation_service import resolve_floor_price
@@ -177,6 +178,42 @@ def _first_item_or_join(value: Any, join_sep: str = ", ") -> str | None:
             return None
         return str(value[0]) if len(value) == 1 else join_sep.join(str(v) for v in value)
     return str(value) if value else None
+
+
+def _coerce_fabric_grade_field(value: Any) -> str | None:
+    """API may send fabric_grade as str or list[str]; schema expects a single string."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                return text
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _pricing_config_response(cfg: Any, *, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "styles": {
+            k: {"base": v.base, "fabric_length": v.fabric_length, "category": v.category}
+            for k, v in cfg.styles.items()
+        },
+        "fabric_grades": dict(cfg.fabric_grades),
+        "embroidery": dict(cfg.embroidery),
+        "markup": cfg.markup,
+        "addons": {
+            k: {"price": a.price, "charge_per": a.charge_per, "name": a.name}
+            for k, a in cfg.addons.items()
+        },
+        "delivery_fee_default": cfg.delivery_fee_default,
+        "delivery_options": dict(cfg.delivery_options),
+        "_config": cfg,
+    }
+    if raw is not None:
+        out["raw"] = raw
+    return out
 
 
 def _normalize_product(product: dict[str, Any]) -> dict[str, Any]:
@@ -410,27 +447,61 @@ def _normalize_fabric(fabric: dict[str, Any]) -> dict[str, Any]:
     category_raw = raw.get("dress_category") or raw.get("category")
     category = _first_item_or_join(category_raw) if isinstance(category_raw, list) else category_raw
 
-    # season: v2 returns array
+    # season: keep API values; do not invent All-Season
     season_raw = raw.get("season")
-    season = _first_item_or_join(season_raw) if isinstance(season_raw, list) else season_raw
+    seasons: list[str] = []
+    if isinstance(season_raw, list):
+        seasons = [str(s).strip() for s in season_raw if str(s).strip()]
+    elif season_raw:
+        seasons = [str(season_raw).strip()]
+    season = ", ".join(seasons) if seasons else None
 
     # embroidery: v2 returns array
     embroidery_raw = raw.get("embroidery")
     embroidery = _first_item_or_join(embroidery_raw) if isinstance(embroidery_raw, list) else embroidery_raw
+
+    image_url = raw.get("image_url") or raw.get("primary_image_url") or raw.get("imageUrl")
+    if not image_url:
+        images = raw.get("images") or []
+        if isinstance(images, list) and images:
+            first = images[0]
+            image_url = first.get("url") if isinstance(first, dict) else first
+        elif isinstance(images, str):
+            image_url = images
+    if not image_url and raw.get("image"):
+        image_url = raw.get("image")
+
+    # Keep full dress_category list for event/garment filtering (not only first item).
+    dress_categories: list[str] = []
+    if isinstance(category_raw, list):
+        dress_categories = [str(c).strip() for c in category_raw if str(c).strip()]
+    elif category_raw:
+        dress_categories = [str(category_raw).strip()]
 
     normalized = {
         "catalog_code": str(catalog_code) if catalog_code else "",
         "name": name,
         "available_colors": [str(c) for c in colors],
         "description": raw.get("description") or raw.get("desc"),
-        "image_url": raw.get("image_url"),
+        "image_url": resolve_backend_asset_url(image_url) if image_url else None,
         "fabric_type": fabric_type_str,
         "pattern": pattern,
         "category": category,
-        "season": str(season).strip().title() if season else "All-Season",
+        "dress_category": dress_categories,
+        "season": season,
+        "seasons": seasons,
         "embroidery": embroidery,
         # Extra v2 fields (pass through)
         "fabric_id": raw.get("fabric_id"),
+        "fabric_grade": _coerce_fabric_grade_field(
+            raw.get("fabric_grade")
+            or raw.get("grade")
+            or raw.get("fabricGrade")
+            or raw.get("grade_name")
+        ),
+        "grade": _coerce_fabric_grade_field(
+            raw.get("grade") or raw.get("fabric_grade") or raw.get("fabricGrade")
+        ),
         "linked_products_count": raw.get("linked_products_count"),
         "linked_products": raw.get("linked_products"),
     }
@@ -540,6 +611,7 @@ class BackendAPIClient:
     - GET  /accessories/{accessory_id}
     - POST /inventory/check
     - POST /handover/create
+    - POST /checkout
     """
 
     def __init__(self) -> None:
@@ -752,7 +824,11 @@ class BackendAPIClient:
             body["pattern"] = str(filters["pattern"]).strip()
         
         if filters.get("season"):
-            body["season"] = str(filters["season"]).strip()
+            from app.services.styling_rules import map_season_for_catalog_api
+
+            body["season"] = map_season_for_catalog_api(str(filters["season"])) or str(
+                filters["season"]
+            ).strip()
         
         # Pagination: v2 uses page (1-based) instead of offset
         limit = int(filters.get("limit") or 10)
@@ -897,7 +973,11 @@ class BackendAPIClient:
             body["dress_category"] = str(dress_category).strip()
         
         if filters.get("season"):
-            body["season"] = str(filters["season"]).strip()
+            from app.services.styling_rules import map_season_for_catalog_api
+
+            body["season"] = map_season_for_catalog_api(str(filters["season"])) or str(
+                filters["season"]
+            ).strip()
         
         # Pagination: v2 uses page (1-based) instead of offset
         limit = int(filters.get("limit") or 10)
@@ -1015,6 +1095,122 @@ class BackendAPIClient:
         )
         return result
 
+    async def get_pricing_config(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        """
+        GET /pricing-config → Sales Agent pricing tables (styles, grades, embroidery, markup, addons, delivery).
+
+        Returns normalized dict via pricing_config.normalize_pricing_config (also cached).
+        On API failure or empty tables, falls back to excel_reference so CUSTOM checkout
+        never ships without a calculator unit_price.
+        """
+        from app.services.pricing_config import (
+            excel_reference_pricing_config,
+            get_cached_pricing_config,
+            normalize_pricing_config,
+            set_cached_pricing_config,
+        )
+
+        if not force_refresh:
+            cached = get_cached_pricing_config()
+            # Ignore empty/corrupt cache from older normalizers
+            if cached is not None and cached.styles and cached.fabric_grades:
+                return _pricing_config_response(cached)
+
+        if settings.USE_MOCK_DATA:
+            logger.info("Using MOCK / excel reference pricing-config")
+            cfg = set_cached_pricing_config(excel_reference_pricing_config())
+            return _pricing_config_response(cfg)
+
+        logger.info("Backend API get_pricing_config start")
+        result: Any = None
+        try:
+            result = await self._request("GET", "/pricing-config")
+            cfg = normalize_pricing_config(result)
+        except BackendAPIError as exc:
+            logger.warning(
+                "pricing-config API failed — using excel_reference fallback err=%s",
+                exc,
+            )
+            cfg = set_cached_pricing_config(excel_reference_pricing_config())
+            return _pricing_config_response(cfg)
+        except Exception as exc:
+            logger.warning(
+                "pricing-config unexpected error — using excel_reference fallback err=%s",
+                exc,
+            )
+            cfg = set_cached_pricing_config(excel_reference_pricing_config())
+            return _pricing_config_response(cfg)
+
+        if not cfg.styles or not cfg.fabric_grades:
+            logger.warning(
+                "pricing-config empty after normalize styles=%s grades=%s — excel_reference fallback",
+                len(cfg.styles),
+                len(cfg.fabric_grades),
+            )
+            cfg = set_cached_pricing_config(excel_reference_pricing_config())
+            return _pricing_config_response(
+                cfg,
+                raw=result if isinstance(result, dict) else {},
+            )
+
+        set_cached_pricing_config(cfg)
+        logger.info(
+            "Backend API get_pricing_config end styles=%s grades=%s embroidery=%s addons=%s markup=%s delivery_default=%s",
+            len(cfg.styles),
+            len(cfg.fabric_grades),
+            len(cfg.embroidery),
+            len(cfg.addons),
+            cfg.markup,
+            cfg.delivery_fee_default,
+        )
+        return _pricing_config_response(
+            cfg,
+            raw=result if isinstance(result, dict) else {},
+        )
+
+    async def create_checkout_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /checkout → { data: { checkout_url, session_id, ... } }."""
+        items = payload.get("items") or []
+        logger.info(
+            "Backend API create_checkout_session start user_type=%s item_count=%s",
+            payload.get("user_type"),
+            len(items) if isinstance(items, list) else 0,
+        )
+        if settings.USE_MOCK_DATA:
+            logger.info("Backend API create_checkout_session skipped — USE_MOCK_DATA")
+            print_payload("CHECKOUT API SKIPPED USE_MOCK_DATA", payload)
+            return {"success": False, "checkout_url": None, "session_id": None}
+
+        print_payload("CHECKOUT API REQUEST POST /checkout", payload)
+        try:
+            result = await self._request("POST", "/checkout", json=payload)
+        except Exception as exc:
+            print_payload("CHECKOUT API ERROR POST /checkout", {"error": str(exc), "type": type(exc).__name__})
+            raise
+        print_payload("CHECKOUT API RESPONSE POST /checkout", result)
+        if not isinstance(result, dict):
+            logger.warning("Backend API create_checkout_session unexpected payload type")
+            return {"success": False, "checkout_url": None, "session_id": None}
+
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        checkout_url = data.get("checkout_url")
+        session_id = data.get("session_id")
+        success = bool(result.get("success", True) and checkout_url)
+        logger.info(
+            "Backend API create_checkout_session end success=%s has_url=%s session_id=%s",
+            success,
+            bool(checkout_url),
+            session_id,
+        )
+        return {
+            "success": success,
+            "checkout_url": checkout_url,
+            "session_id": session_id,
+            "items_summary": data.get("items_summary"),
+            "total_amount": data.get("total_amount"),
+            "currency": data.get("currency"),
+            "expires_in": data.get("expires_in"),
+        }
 
     async def search_accessories(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
         """POST /accessories/search"""

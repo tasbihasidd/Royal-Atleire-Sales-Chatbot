@@ -21,6 +21,8 @@ class FabricSchema(BaseModel):
     category: str | None = None
     season: str | None = None
     embroidery: str | None = None
+    # Pass-through from fabric catalogue for pricing-config grade lookup (not invented).
+    fabric_grade: str | None = None
 
 
 class FabricSearchRequestSchema(BaseModel):

@@ -58,7 +58,16 @@ class NegotiationEngine:
         state.original_price = list_price
         state.floor_price = floor
         state.customer_target_price = customer_offered_price or state.customer_target_price
-        state.round_number += 1
+        resuming_color = (
+            str(current_state.last_action or "").lower() == "ask_color_preference"
+            and not color_pending
+        )
+        # Colour ask paused the gift round — completing it must not burn the next ladder step.
+        if resuming_color:
+            if state.round_number < 2:
+                state.round_number = 2
+        else:
+            state.round_number += 1
         round_num = state.round_number
 
         if customer_offered_price is not None:
@@ -112,7 +121,9 @@ class NegotiationEngine:
             names = [n for n in names if n]
             state.offered_bundles = names
 
-            threshold_label = "100,000" if currency_label not in ("GBP", "USD", "EUR") else "£1,000"
+            threshold_label = (
+                "100,000" if currency_label not in ("GBP", "USD", "EUR") else "£350"
+            )
             if color_pending:
                 color_ask = (
                     f" from this piece's available colours only: {colors_bit}"
@@ -293,9 +304,10 @@ class NegotiationEngine:
                 ),
             }
 
+        state.last_action = str(strategy.get("action") or "")
         logger.info(
             "Negotiation engine turn round=%s list_price=%s floor_price=%s offered_price=%s "
-            "action=%s accessories=%s free=%s margin_budget=%s",
+            "action=%s accessories=%s free=%s margin_budget=%s resume_color=%s",
             round_num,
             list_price,
             floor,
@@ -304,6 +316,7 @@ class NegotiationEngine:
             len(accessory_rows),
             strategy.get("free_accessory"),
             headroom,
+            resuming_color,
         )
         return state, strategy
 

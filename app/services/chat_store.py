@@ -58,7 +58,11 @@ SESSION_CONTEXT_KEYS = (
     "custom_image_url",
     "custom_design_result",
     "custom_instructions",
+    "price_quote",
+    "customize_pricing_mode",
     "market_currency",
+    "checkout_url",
+    "checkout_session_id",
 )
 
 
@@ -273,11 +277,15 @@ class ChatStore:
             "sales_stage",
             "buying_intent",
             "selected_fabric_catalog_code",
+            "customization_stage",
+            "cut_style",
             "selected_variation_id",
             "selected_variation_name",
             "selected_product_variation_id",
             "selected_product_variation_name",
             "market_currency",
+            "checkout_url",
+            "checkout_session_id",
         ):
             if result.get(key) is not None and result.get(key) != "":
                 context[key] = result[key]
@@ -294,6 +302,10 @@ class ChatStore:
             context["custom_design_result"] = result["custom_design_result"]
         if result.get("custom_instructions"):
             context["custom_instructions"] = result["custom_instructions"]
+        if isinstance(result.get("price_quote"), dict):
+            context["price_quote"] = result["price_quote"]
+        if result.get("customize_pricing_mode") is not None:
+            context["customize_pricing_mode"] = result["customize_pricing_mode"]
         profile = result.get("customer_profile") or {}
         if isinstance(profile, dict) and profile.get("declined_slots") is not None:
             context["declined_slots"] = profile.get("declined_slots")

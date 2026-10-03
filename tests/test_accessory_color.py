@@ -144,7 +144,7 @@ def test_negotiation_round2_asks_color_before_gift():
         margin_budget=100,
     )
     accessories = [{"name": "Black shawl", "price": 80, "accessory_type": "Stole"}]
-    _, strategy = negotiation_engine.process_negotiation_round(
+    state, strategy = negotiation_engine.process_negotiation_round(
         current_state=state,
         list_price=300,
         floor_price_override=200,
@@ -160,6 +160,51 @@ def test_negotiation_round2_asks_color_before_gift():
     assert strategy["accessories"] == []
     assert "black" in strategy["prompt_directive"].lower()
     assert "do not offer a complimentary accessory" in strategy["prompt_directive"].lower()
+    assert state.last_action == "ask_color_preference"
+
+
+def test_negotiation_resumes_gift_after_color_reply():
+    """Colour ask is a pause in round 2 — answering it must gift, not skip to round 3."""
+    state = NegotiationStateSchema()
+    state, _ = negotiation_engine.process_negotiation_round(
+        current_state=state,
+        list_price=300,
+        floor_price_override=200,
+        accessories=[],
+        currency="GBP",
+        margin_budget=100,
+    )
+    accessories = [{"name": "Gold stole", "price": 80, "accessory_type": "Stole"}]
+    state, _ = negotiation_engine.process_negotiation_round(
+        current_state=state,
+        list_price=300,
+        floor_price_override=200,
+        accessories=accessories,
+        currency="GBP",
+        margin_budget=100,
+        bundle_offer={"type": "FREE"},
+        product_colors=["Black", "Gold", "Maroon"],
+        color_pending=True,
+    )
+    assert state.round_number == 2
+    assert state.last_action == "ask_color_preference"
+
+    state, strategy = negotiation_engine.process_negotiation_round(
+        current_state=state,
+        list_price=300,
+        floor_price_override=200,
+        accessories=accessories,
+        currency="GBP",
+        margin_budget=100,
+        bundle_offer={"type": "FREE"},
+        product_color="Gold",
+        product_colors=["Black", "Gold", "Maroon"],
+        color_pending=False,
+    )
+    assert state.round_number == 2
+    assert strategy["action"] == "offer_free_accessory"
+    assert strategy["free_accessory"] is True
+    assert strategy["accessories"][0]["name"] == "Gold stole"
 
 
 def test_negotiation_round2_one_color_matched_gift():

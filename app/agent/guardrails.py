@@ -18,6 +18,10 @@ JAILBREAK_PATTERNS = [
 # Sensitive internal PII / Wholesale keywords (field-style tokens)
 INTERNAL_LEAK_KEYWORDS = [
     "floor_price",
+    "total_markup_fee",
+    "markup_amount",
+    "markup_rate",
+    "subtotal_no_markup",
     "wholesale_cost",
     "supplier_margin",
     "cost_price",
@@ -29,6 +33,8 @@ INTERNAL_LEAK_KEYWORDS = [
 # Customer-facing leak phrases (align with score_agent_hard_test FLOOR_LEAK_RE)
 CUSTOMER_FACING_LEAK_PATTERNS = [
     re.compile(r"\bfloor[_\s-]?price\b", re.IGNORECASE),
+    re.compile(r"\btotal[_\s-]?markup[_\s-]?fee\b", re.IGNORECASE),
+    re.compile(r"\bmarkup[_\s-]?(?:fee|rate|amount|percent|%)\b", re.IGNORECASE),
     re.compile(r"\bmargin_budget\b", re.IGNORECASE),
     re.compile(r"\bmargin\b", re.IGNORECASE),
     re.compile(r"\bwholesale(?:[_\s-]?(?:cost|price))?\b", re.IGNORECASE),
@@ -54,7 +60,7 @@ class CommercialGuardrails:
             if pattern.search(user_message):
                 logger.warning("Prompt Armor triggered on user message: %s", user_message[:100])
                 return True, (
-                    "I am programmed to assist you exclusively with Royal Atelier luxury menswear, "
+                    "I am programmed to assist you exclusively with Turabees luxury menswear, "
                     "tailoring, and order consultations. How may I assist with your attire today?"
                 )
         return False, None

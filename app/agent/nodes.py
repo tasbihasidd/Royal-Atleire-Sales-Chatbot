@@ -41,7 +41,7 @@ from app.tools.handover_tools import create_human_handover
 from app.agent.discovery_engine import discovery_engine
 from app.services.recommendation_service import select_products_for_display, MAX_PRODUCTS_TO_SHOW
 from app.services.negotiation_engine import negotiation_engine
-from app.services.styling_rules import derive_season_from_text
+from app.services.styling_rules import derive_season_from_text, map_season_for_catalog_api
 from app.services.accessories_service import (
     filter_accessories_for_product,
     filter_free_gift_candidates,
@@ -73,9 +73,43 @@ from app.agent.guardrails import guardrails
 from app.schemas.profile import CustomerProfileSchema
 from app.schemas.negotiation import NegotiationStateSchema
 from app.services.custom_design_service import generate_bespoke_design
+from app.services.checkout_service import build_checkout_request, is_custom_checkout
+from app.services.price_quote_service import public_price_quote, resolve_sellable_price
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _refresh_price_quote(state: dict[str, Any]) -> dict[str, Any]:
+    """Resolve catalogue/calculator quote; never raise into the graph."""
+    try:
+        quote = await resolve_sellable_price(dict(state))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "price_quote refresh failed session_id=%s err=%s",
+            state.get("session_id"),
+            exc,
+        )
+        return {
+            "price_quote": {
+                "ok": False,
+                "source": "error",
+                "error": str(exc),
+            },
+            "customize_pricing_mode": None,
+        }
+    mode = quote.get("customize_mode") if isinstance(quote, dict) else None
+    profile = dict(state.get("customer_profile") or {})
+    emb = (quote or {}).get("embroidery_inference") if isinstance(quote, dict) else None
+    if isinstance(emb, dict) and emb.get("embroidery_tier"):
+        profile["embroidery_tier"] = emb["embroidery_tier"]
+    out: dict[str, Any] = {
+        "price_quote": quote,
+        "customize_pricing_mode": mode,
+    }
+    if profile:
+        out["customer_profile"] = profile
+    return out
 
 
 def _llm():
@@ -467,6 +501,12 @@ def _build_planner_input(
         "product_type": product_type,
         "selected_variation_id": state.get("selected_variation_id"),
         "selected_variation_name": state.get("selected_variation_name"),
+        "selected_product_variation_id": state.get("selected_product_variation_id"),
+        "selected_product_variation_name": state.get("selected_product_variation_name"),
+        "sales_stage": state.get("sales_stage"),
+        "buying_intent": state.get("buying_intent"),
+        "negotiation_round": (state.get("negotiation_state") or {}).get("round_number") if isinstance(state.get("negotiation_state"), dict) else None,
+        "negotiation_last_action": (state.get("negotiation_state") or {}).get("last_action") if isinstance(state.get("negotiation_state"), dict) else None,
         "color": state.get("color"),
         "size": state.get("size"),
         "measurement_path": state.get("measurement_path"),
@@ -679,6 +719,20 @@ def _normalize_event_type_label(value: str | None) -> str | None:
     return cleaned[:1].upper() + cleaned[1:] if cleaned else None
 
 
+def _default_category_for_event(event_type: str | None) -> str | None:
+    """Event → default garment category for catalogue / fabric dress_category filter."""
+    ev = str(event_type or "").lower()
+    if not ev:
+        return None
+    if any(x in ev for x in ("barat", "baraat", "nikah", "nikkah", "mehndi", "mehendi", "mehandi")):
+        return "Sherwani"
+    if any(x in ev for x in ("walima", "valima", "reception")):
+        return "Suits"
+    if "engagement" in ev:
+        return "Prince Coat"
+    return None
+
+
 def _normalize_wedding_date(value: str | None) -> str | None:
     """Collapse 'mid of june' / 'June 2026' → 'June' (or season word)."""
     if not value:
@@ -812,6 +866,55 @@ def _force_short_product_reply(
         or "atelier"
     )
     return _short_product_card_intro(user_message, cat)
+
+
+_MEASUREMENT_ASK_MARKERS = (
+    "measurement",
+    "measurements",
+    "standard size",
+    "body measurements",
+    "chest",
+    "waist",
+    "shoulder",
+    "sleeve",
+    "jacket length",
+    "naap",
+    "size chart",
+    "inches mein",
+    "size pasand",
+    "aapki measurements",
+    "body measurement",
+)
+
+
+def _asks_for_measurements(reply: str) -> bool:
+    text = (reply or "").lower()
+    return any(m in text for m in _MEASUREMENT_ASK_MARKERS)
+
+
+def _force_checkout_handoff_reply(
+    reply: str,
+    *,
+    user_message: str,
+    checkout_url: str | None,
+) -> str:
+    """When checkout is ready, never let the LLM pivot back to chat measurements."""
+    if not checkout_url:
+        return reply
+    if not _asks_for_measurements(reply):
+        return reply
+    urdu = _looks_roman_urdu(user_message)
+    if urdu:
+        return (
+            "Zabardast, Janab! Yeh design aapke liye ready hai. "
+            "Size aur measurements checkout page par fill ho jayengi — "
+            f"ab secure checkout open karein: {checkout_url}"
+        )
+    return (
+        "Wonderful — this bespoke design is ready for you. "
+        "Size and measurements are collected on the checkout page — "
+        f"please proceed to secure checkout: {checkout_url}"
+    )
 
 
 def _extract_explicit_color(text: str) -> str | None:
@@ -1001,6 +1104,85 @@ def _is_piece_or_colour_confirm(user_message: str) -> bool:
     return False
 
 
+_LIKE_CONFIRM_CUES = (
+    "ye wala",
+    "yehi",
+    "this one",
+    "isko le",
+    "ye le",
+    "pasand",
+    "nice",
+    "i like",
+    "liked",
+    "looks good",
+    "looks nice",
+    "love it",
+    "love this",
+    "perfect",
+    "mjhay ye",
+    "mujhe ye",
+    "mujhay ye",
+    "ye pasand",
+    "thek hai",
+    "theek hai",
+    "thek he",
+    "theek he",
+    "acha lag",
+    "achha lag",
+    "accha lag",
+    "lag raha",
+    "lag rahi",
+    "lagraha",
+    "lagrahi",
+    "mjhay acha",
+    "mujhe acha",
+    "bohot acha",
+    "zabardast",
+)
+
+
+def _is_like_confirm(user_message: str) -> bool:
+    """Customer affirming the currently shown/selected piece — not a new catalog browse."""
+    if discovery_engine.customer_asked_availability(user_message):
+        return False
+    if _is_explicit_checkout_request(user_message):
+        return False
+    text = (user_message or "").lower().strip()
+    if not text:
+        return False
+    if discovery_engine.customer_asked_for_catalog(user_message):
+        # "ye pasand hai, aur dikhao" is still a catalog ask.
+        if any(cue in text for cue in ("dikhao", "dekhao", "show me", "show more", "aur options", "kuch aur")):
+            return False
+    return any(cue in text for cue in _LIKE_CONFIRM_CUES)
+
+
+def _negotiation_last_action(state: SalesAgentState | dict[str, Any] | None) -> str:
+    session = state or {}
+    neg_state = session.get("negotiation_state") if isinstance(session.get("negotiation_state"), dict) else {}
+    prev = session.get("negotiation_result") if isinstance(session.get("negotiation_result"), dict) else {}
+    strategy = prev.get("strategy") if isinstance(prev.get("strategy"), dict) else {}
+    return str(
+        (neg_state or {}).get("last_action")
+        or prev.get("action")
+        or strategy.get("action")
+        or ""
+    ).lower()
+
+
+def _negotiation_awaiting_color(state: SalesAgentState | dict[str, Any] | None) -> bool:
+    return _negotiation_last_action(state) == "ask_color_preference"
+
+
+def _in_active_negotiation(state: SalesAgentState | dict[str, Any] | None) -> bool:
+    session = state or {}
+    try:
+        round_n = int((session.get("negotiation_state") or {}).get("round_number") or 0)
+    except (TypeError, ValueError):
+        round_n = 0
+    return round_n >= 1 or session.get("sales_stage") == "negotiation"
+
+
 def _is_product_variation_inquiry(text: str) -> bool:
     t = (text or "").lower()
     return any(
@@ -1148,7 +1330,14 @@ def _extract_cut_style(text: str | None) -> str | None:
         ("mandarin", "Mandarin Collar"),
         ("sherwani collar", "Sherwani Collar"),
         ("three piece", "Three Piece"),
+        ("3 piece", "Three Piece"),
         ("two piece", "Two Piece"),
+        ("2 piece", "Two Piece"),
+        ("sherwani", "Sherwani"),
+        ("kurta", "Kurta"),
+        ("waistcoat", "Waistcoat"),
+        ("indo western", "Indo-Western"),
+        ("indo-western", "Indo-Western"),
     )
     for needle, label in pairs:
         if needle in low:
@@ -1163,14 +1352,73 @@ def _match_fabric_from_message(
     text = (message or "").lower().strip()
     if not text or not fabrics:
         return None
+    # Explicit choose / catalog code from fabric card CTA
+    code_m = re.search(
+        r"(?:catalog(?:_code)?|code|#[\s]*)[:\s#]*([a-z0-9\-]{3,})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if code_m:
+        want = code_m.group(1).lower()
+        for fabric in fabrics:
+            code = str(fabric.get("catalog_code") or "").lower().strip()
+            if code and (code == want or code.endswith(want) or want in code):
+                return fabric
+    best: tuple[int, dict[str, Any]] | None = None
     for fabric in fabrics:
         name = str(fabric.get("name") or "").lower().strip()
         code = str(fabric.get("catalog_code") or "").lower().strip()
-        if name and len(name) >= 3 and name in text:
-            return fabric
         if code and len(code) >= 3 and code in text:
             return fabric
-    return None
+        if not name or len(name) < 3:
+            continue
+        if name in text:
+            score = len(name)
+            if best is None or score > best[0]:
+                best = (score, fabric)
+            continue
+        # Token overlap for longer fabric titles (e.g. "Parchment Solid Linen")
+        tokens = [t for t in re.split(r"[^a-z0-9]+", name) if len(t) > 2]
+        if not tokens:
+            continue
+        hits = sum(1 for t in tokens if t in text)
+        if hits >= 2 or (hits == 1 and any(len(t) >= 6 and t in text for t in tokens)):
+            score = hits * 10 + sum(len(t) for t in tokens if t in text)
+            if best is None or score > best[0]:
+                best = (score, fabric)
+    return best[1] if best else None
+
+
+def _is_fabric_choose_message(message: str | None) -> bool:
+    text = (message or "").lower()
+    return bool(
+        re.search(r"\b(i choose|choose|chose|select|selected|pasand|yeh wala|ye wala)\b", text)
+        and re.search(r"\bfabric\b|catalog", text)
+    )
+
+
+def _is_design_revision_request(message: str | None) -> bool:
+    """True when customer wants the existing bespoke mockup changed / regenerated."""
+    text = (message or "").lower().strip()
+    if not text:
+        return False
+    revision_cues = (
+        "minimal", "minimalist", "simple", "plain", "subtle",
+        "no embroidery", "without embroidery", "embroidery na", "embroidery nahi",
+        "extra embroidery na", "koi extra", "halka", "light embroidery", "lighter",
+        "less embroidery", "kam embroidery", "kam kaam", "less work", "heavy nahi",
+        "not heavy", "bilkul simple", "change", "badal", "dobara", "again",
+        "regenerate", "re-generate", "regen", "naya design", "new design",
+        "update design", "modify", "thoda change", "zyada simple", "clean look",
+        "no gold", "bina embroidery", "embroidery mat", "embroidery hata",
+    )
+    if any(c in text for c in revision_cues):
+        return True
+    # Short Roman-Urdu tweak after a mockup exists, e.g. "minimal sa ho"
+    if re.search(r"\b(ho|karo|kar do|krdo|kr do|banado|bana do)\b", text) and len(text.split()) <= 12:
+        if any(w in text for w in ("minimal", "simple", "halka", "kam", "zyada", "embroidery", "kaam", "color", "colour")):
+            return True
+    return False
 
 
 def _has_custom_image(state: SalesAgentState) -> bool:
@@ -1205,15 +1453,35 @@ def _apply_customization_stages(
     cut_style: str | None,
     selected_fabric_code: str | None,
     fabrics: list[dict[str, Any]],
+    wants_revision: bool = False,
 ) -> tuple[str | None, list[str], str | None]:
     """Path A sequential stages; Path B generates when specs exist. Returns (stage, steps, note)."""
     steps = list(required_steps)
+
+    # Existing mockup + customer asked for a design tweak → regenerate (do not jump to measurements).
+    if wants_revision and (_has_custom_image(state) or selected_fabric_code or selected_product_id):
+        steps = _insert_step(steps, "generate_custom_design")
+        return "generation", steps, (
+            "Customer asked to revise the bespoke visual. Regenerate a NEW mockup with their latest "
+            "instructions (e.g. minimal / no embroidery). Do NOT reuse or describe the old image as final."
+        )
+
     if _has_custom_image(state):
-        return "measurements", [s for s in steps if s != "generate_custom_design"], None
+        # Measurements live on the checkout page — never collect size/naap in chat after mockup.
+        steps = [s for s in steps if s not in ("generate_custom_design", "collect_measurements", "validate_measurements")]
+        # If they already confirmed this turn, schedule checkout immediately.
+        # (Planner later also forces close_sale via likes_bespoke — this helps heuristics.)
+        return "checkout", steps, (
+            "Bespoke visual is already shown. Invite brief feedback. "
+            "When they say they like it (pasand / perfect / I like this), run close_sale for checkout_url. "
+            "Do NOT ask standard size or body measurements in chat — those fields are on the checkout page."
+        )
 
     # Path B: customize a selected catalogue product
     if selected_product_id:
         if has_details:
+            if "generate_custom_design" not in steps:
+                steps = list(dict.fromkeys([*steps, "generate_custom_design"]))
             return "generation", steps, None
         return (
             state.get("customization_stage") or "preferences",
@@ -1221,34 +1489,35 @@ def _apply_customization_stages(
             None,
         )
 
-    # Path A: preferences → fabric_selection → cut_style → generation
-    has_prefs = bool(event_type or color or product_type)
-    if has_details and (selected_fabric_code or cut_style):
-        if "generate_custom_design" not in steps:
-            steps = list(dict.fromkeys([*steps, "generate_custom_design"]))
-        return "generation", steps, None
-
-    if selected_fabric_code and cut_style:
+    # Path A: preferences → fabric_selection → design preference → generation
+    # Fabric alone is NOT enough to generate — ask how they want the outfit designed.
+    has_design_pref = bool(cut_style or product_type)
+    if selected_fabric_code and has_design_pref:
         steps = _insert_step(steps, "generate_custom_design")
         return "generation", steps, None
 
-    if selected_fabric_code and not cut_style:
+    if selected_fabric_code and not has_design_pref:
         steps = [s for s in steps if s != "generate_custom_design"]
         return "cut_style", steps, (
-            "Ask which cut/style they want (e.g. Angrakha, Bandhgala, Achkan, Tuxedo). "
+            "Customer already chose a fabric (see selected_fabric_catalog_code). "
+            "Confirm the fabric briefly in ONE short line, then ask ONLY how they want the outfit designed "
+            "(e.g. Sherwani, Angrakha, Bandhgala, Achkan, Prince Coat, Tuxedo / 3-piece suit, "
+            "embroidery heavy or light). "
+            "Do NOT list fabric colour variants, catalog codes, or other fabrics. "
             "Do NOT generate an image yet."
         )
 
+    has_prefs = bool(event_type or color or product_type)
     if has_prefs and not selected_fabric_code:
         steps = [s for s in steps if s != "generate_custom_design"]
         if fabrics:
             return "fabric_selection", steps, (
-                "Fabrics are already listed. Ask the customer to pick one name or catalog_code. "
-                "Do NOT generate an image yet."
+                "Fabrics are shown as cards. Ask the customer to tap Choose on one fabric. "
+                "Do NOT list fabric names or colours in text. Do NOT generate an image yet."
             )
         steps = _insert_step(steps, "search_fabrics")
         return "fabric_selection", steps, (
-            "Show live fabrics and ask the customer to choose one. Do NOT generate an image yet."
+            "Show live fabrics and ask the customer to Choose one. Do NOT generate an image yet."
         )
 
     steps = [s for s in steps if s != "generate_custom_design"]
@@ -1275,35 +1544,68 @@ def _clean_product_search_query(user_message: str, target_query: str | None = No
     return cleaned if len(cleaned) >= 2 else text
 
 
+# Generic garment words — alone they mean "browse category", not "pick this SKU".
+_GENERIC_PRODUCT_TOKENS = frozenset(
+    {
+        "suit",
+        "suits",
+        "sherwani",
+        "shrwani",
+        "tuxedo",
+        "tux",
+        "blazer",
+        "jacket",
+        "coat",
+        "piece",
+        "pieces",
+        "outfit",
+        "dress",
+        "garment",
+        "collection",
+        "atelier",
+        "menswear",
+        "wedding",
+    }
+)
+
+
 def _match_product_from_message(
     user_message: str,
     products: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-
     """Match a listed product when the customer names it (e.g. Blue Nawab)."""
     text = (user_message or "").lower().strip()
     if not text or not products:
         return None
+
     best: tuple[int, dict[str, Any]] | None = None
     for item in products:
         name = str(item.get("name") or "").lower().strip()
         if not name:
             continue
-        # Significant tokens from product name (skip tiny words)
-        tokens = [t for t in re.split(r"[^a-z0-9]+", name) if len(t) > 2]
+        # Unique significant tokens (skip tiny + generic garment words like suit/sherwani)
+        tokens = list(
+            dict.fromkeys(
+                t
+                for t in re.split(r"[^a-z0-9]+", name)
+                if len(t) > 2 and t not in _GENERIC_PRODUCT_TOKENS
+            )
+        )
         if not tokens:
             continue
-        hits = sum(1 for t in tokens if t in text)
-        # Need at least 2 token hits, or 1 strong distinctive token (len>=5) exclusive-ish
+        # Word-boundary hits — "suit" must not match inside "suits dikhao"
+        hits = sum(1 for t in tokens if re.search(rf"\b{re.escape(t)}\b", text))
         score = hits
         if name in text:
             score = max(score, len(tokens) + 1)
-        # Tolerate common Sherwani / Shrwani catalogue typos
         if "sherwani" in text and "shrwani" in name:
             score = max(score, hits + 1)
         if "shrwani" in text and "sherwani" in name:
             score = max(score, hits + 1)
-        if hits >= 2 or (hits == 1 and any(len(t) >= 5 and t in text for t in tokens)):
+        distinctive = [t for t in tokens if len(t) >= 5]
+        if hits >= 2 or (
+            hits == 1 and any(re.search(rf"\b{re.escape(t)}\b", text) for t in distinctive)
+        ):
             if best is None or score > best[0]:
                 best = (score, item)
     return best[1] if best else None
@@ -1386,7 +1688,7 @@ def _pick_confirmed_product(
 
 def _build_checkout_hand_off_note(
     *,
-    product_url: str,
+    checkout_url: str,
     product_name: str | None = None,
     variation_name: str | None = None,
     color: str | None = None,
@@ -1404,9 +1706,9 @@ def _build_checkout_hand_off_note(
     return (
         f"Customer is ready to checkout{neg} on {label}. "
         f"Reply briefly with name/price (use negotiated offered_price if present), "
-        f"then give this exact product_url: {product_url}. "
-        "They self-checkout on that page (size etc. there). "
-        "Do NOT ask size, bespoke, measurements, or phone."
+        f"then give this exact checkout_url: {checkout_url}. "
+        "They open that link, sign in, and complete order (size etc. there). "
+        "Do NOT invent a cart URL, catalog product_url, or ask size, bespoke, measurements, or phone."
     )
 
 
@@ -1415,6 +1717,7 @@ def _build_product_interest_note(
     product_name: str | None,
     needs_variation: bool,
     variation_names: list[str] | None = None,
+    advance_close: bool = False,
 ) -> str:
     name = product_name or "this piece"
     if needs_variation and variation_names:
@@ -1422,6 +1725,15 @@ def _build_product_interest_note(
             f"Customer liked {name}. List ONLY these product variations: "
             f"{', '.join(variation_names)}. Ask which one. "
             "Do NOT give product_url / checkout link yet. Negotiation may come next."
+        )
+    if advance_close:
+        return (
+            f"Customer confirmed they like {name} — it is already selected. "
+            "Do NOT re-show catalog cards, do NOT say 'here are our options / yeh hain hamare pieces'. "
+            "Advance toward closing in 1–2 short sentences: brief praise, confirm name + price, "
+            "then ONE next step (checkout invite, or whether the price works). "
+            "Do NOT ask for size or body measurements in chat. "
+            "No product_url unless they explicitly said buy/checkout."
         )
     return (
         f"Customer liked {name}. Confirm briefly with name + price only. "
@@ -1438,6 +1750,33 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
     intent = "general"
     handover_reason: str | None = None
     session = state or {}
+
+    # Bespoke mockup approved → checkout directly (size/naap on checkout page).
+    if (
+        _has_custom_image(session)  # type: ignore[arg-type]
+        and _is_like_confirm(user_message)
+        and not _is_design_revision_request(user_message)
+    ):
+        return {
+            "intent": "closing",
+            "sales_stage": "closing",
+            "buying_intent": "ready_to_buy",
+            "required_steps": ["close_sale"],
+            "objection_type": None,
+            "handover_reason": None,
+            "event_type": session.get("event_type"),
+            "product_type": session.get("product_type"),
+            "color": session.get("color"),
+            "size": session.get("size"),
+            "quantity": session.get("quantity") or 1,
+            "budget": session.get("budget"),
+            "wedding_date": session.get("wedding_date"),
+            "selected_product_id": session.get("selected_product_id"),
+            "selected_fabric_catalog_code": session.get("selected_fabric_catalog_code"),
+            "cut_style": session.get("cut_style"),
+            "customization_stage": "checkout",
+            "measurement_path": session.get("measurement_path"),
+        }
 
     detail_keywords = [
         "detail", "details", "more about", "about it", "batao", "tell me more",
@@ -1462,16 +1801,54 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
     if any(w in text for w in ["buy", "purchase", "reserve", "hold", "finalize", "finalise", "book", "order"]):
         steps.append("close_sale")
         intent = "closing"
+    fabric_browse = False
     if any(w in text for w in [
-        "custom", "bespoke", "fabric", "kapra", "customize", "tailor made",
+        "custom", "bespoke", "fabric", "fabrics", "kapra", "kapray", "customize", "tailor made",
         "apna color", "apna colour", "halka kaam", "halka embroidery",
         "kam embroidery", "light work", "less embroidery", "simple kaam",
     ]):
-        steps.append("search_fabrics")
-        intent = "fabric_custom"
-        steps.append("search_products")
-        steps.append("get_product_details")
-        intent = "product_search"
+        # Choosing an already-shown fabric is selection, not another catalogue browse.
+        if _is_fabric_choose_message(user_message) or (
+            session.get("selected_fabric_catalog_code")
+            and any(w in text for w in ("choose", "chose", "pasand", "select"))
+        ):
+            intent = "custom_design"
+            steps = [s for s in steps if s not in ("search_fabrics", "search_products")]
+        else:
+            fabric_browse = any(
+                w in text
+                for w in (
+                    "fabric",
+                    "fabrics",
+                    "kapra",
+                    "kapray",
+                    "cloth",
+                    "swatch",
+                )
+            ) and any(
+                w in text
+                for w in (
+                    "available",
+                    "availbale",
+                    "dikhao",
+                    "dekhao",
+                    "show",
+                    "kon",
+                    "kaun",
+                    "list",
+                    "options",
+                    "hai",
+                    "hain",
+                    "suggest",
+                    "recommend",
+                )
+            )
+            steps.append("search_fabrics")
+            intent = "fabric_custom"
+            # Pure fabric catalogue ask — do not also dump ready-made products.
+            if fabric_browse:
+                steps = [s for s in steps if s not in ("search_products", "get_product_details")]
+                intent = "fabric_custom"
     guidance_words = [
         "suggest", "suggets", "recommend", "suggestion", "no idea", "dont know",
         "don't know", "what to wear", "kya pehnu", "kya pehno", "aap batao",
@@ -1483,11 +1860,20 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
         "available", "stock", "availbale", "dikhao", "dekhao", "show me", "show options",
         "options dikhao", "kuch dikhao", "designs dikhao", "collection dikhao", "pieces dikhao",
     ]
-    if any(w in text for w in show_words) and not is_seeking_guidance and not session.get("selected_product_id"):
+    # Never overwrite a fabric-catalogue ask with ready-made product_search.
+    if (
+        not fabric_browse
+        and intent != "fabric_custom"
+        and any(w in text for w in show_words)
+        and not is_seeking_guidance
+        and not session.get("selected_product_id")
+    ):
         steps.append("search_products")
         intent = "product_search"
     elif (
-        session.get("sales_stage") == "discovery"
+        not fabric_browse
+        and intent != "fabric_custom"
+        and session.get("sales_stage") == "discovery"
         and session.get("event_type")
         and not session.get("selected_product_id")
     ):
@@ -1510,6 +1896,20 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
         if session.get("selected_product_id"):
             steps.append("calculate_negotiation_offer")
             intent = "discount_request" if intent == "general" else "mixed"
+    # Colour reply after we asked colour during negotiation → continue the ladder, do not search.
+    if (
+        session.get("selected_product_id")
+        and _negotiation_awaiting_color(session)
+        and _extract_explicit_color(text)
+    ):
+        steps.append("calculate_negotiation_offer")
+        intent = "discount_request"
+        steps = [s for s in steps if s != "search_products"]
+    # Liked the already-selected piece → do not restart catalog search.
+    if session.get("selected_product_id") and _is_like_confirm(user_message):
+        steps = [s for s in steps if s != "search_products"]
+        if "get_product_details" not in steps:
+            steps.append("get_product_details")
     if any(w in text for w in [
         "height", "chest", "waist", "6'", "6ft", "40r", "38r", "36r", "42r", "44r",
         "naap", "measurement", "size chart", "shoulder", "sleeve",
@@ -1574,6 +1974,17 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
         if month in text:
             wedding_date = month.title()
             break
+    # Common Roman-Urdu / typo month stems (e.g. "decemebr") → full month for season filter.
+    if not wedding_date:
+        month_stems = (
+            ("jan", "January"), ("feb", "February"), ("mar", "March"), ("apr", "April"),
+            ("jun", "June"), ("jul", "July"), ("aug", "August"), ("sep", "September"),
+            ("oct", "October"), ("nov", "November"), ("dec", "December"),
+        )
+        for stem, label in month_stems:
+            if stem in text:
+                wedding_date = label
+                break
     if not wedding_date:
         for season in ("winter", "summer", "autumn", "spring"):
             if season in text:
@@ -1612,28 +2023,38 @@ def log_node_payload(node_name: str):
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(state: SalesAgentState, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            from app.core.payload_log import print_payload
+
             try:
-                in_json = json.dumps(dict(state), indent=2, default=str)
-                logger.info("Node Payload Input: %s", node_name)
-                print(f"\n================================================================================")
-                print(f"📥 [NODE INPUT PAYLOAD] -> Node: {node_name}")
-                print(f"================================================================================")
-                print(in_json)
+                print_payload(
+                    f"NODE IN {node_name}",
+                    {
+                        "session_id": state.get("session_id"),
+                        "user_message": state.get("user_message"),
+                        "intent": state.get("intent"),
+                        "sales_stage": state.get("sales_stage"),
+                        "buying_intent": state.get("buying_intent"),
+                        "required_steps": state.get("required_steps"),
+                        "customization_stage": state.get("customization_stage"),
+                        "selected_product_id": state.get("selected_product_id"),
+                        "selected_fabric_catalog_code": state.get("selected_fabric_catalog_code"),
+                        "cut_style": state.get("cut_style"),
+                        "custom_image_url": bool(state.get("custom_image_url")),
+                        "checkout_url": state.get("checkout_url"),
+                        "products": state.get("products") or [],
+                        "fabrics": state.get("fabrics") or [],
+                    },
+                )
             except Exception as e:
-                print(f"📥 [NODE INPUT PAYLOAD ERROR] -> Node: {node_name}: {e}")
+                print(f"📥 [NODE IN ERROR] {node_name}: {e}", flush=True)
 
             result = await fn(state, *args, **kwargs)
 
             try:
-                out_json = json.dumps(result, indent=2, default=str)
-                logger.info("Node Payload Output: %s", node_name)
-                print(f"--------------------------------------------------------------------------------")
-                print(f"📤 [NODE RETURNED OUTPUT] <- Node: {node_name}")
-                print(f"--------------------------------------------------------------------------------")
-                print(out_json)
-                print(f"================================================================================\n")
+                brief = dict(result) if isinstance(result, dict) else {"result": result}
+                print_payload(f"NODE OUT {node_name}", brief)
             except Exception as e:
-                print(f"📤 [NODE RETURNED OUTPUT ERROR] <- Node: {node_name}: {e}")
+                print(f"📤 [NODE OUT ERROR] {node_name}: {e}", flush=True)
 
             return result
         return wrapper
@@ -1967,26 +2388,26 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         session_products = []
 
     # After we asked for a colour to match an accessory, a colour reply continues negotiation.
-    prev_neg = state.get("negotiation_result") if isinstance(state.get("negotiation_result"), dict) else {}
-    prev_neg_action = str(
-        prev_neg.get("action")
-        or (prev_neg.get("strategy") or {}).get("action")
-        or ""
-    ).lower()
     named_color_now = _extract_explicit_color(user_message)
+    awaiting_color = _negotiation_awaiting_color(state)
     if (
-        prev_neg_action == "ask_color_preference"
+        awaiting_color
         and (state.get("selected_product_id") or plan.get("selected_product_id"))
         and named_color_now
         and "create_human_handover" not in required_steps
     ):
         if "calculate_negotiation_offer" not in required_steps:
             required_steps = list(dict.fromkeys([*required_steps, "calculate_negotiation_offer"]))
-        intent = "discount_request" if intent == "general" else intent
+        intent = "discount_request"
         sales_stage = "negotiation"
         session_products = []
         if not plan.get("color"):
             plan["color"] = named_color_now
+        # Colour answer is not a catalog browse or a custom-design request.
+        required_steps = [
+            s for s in required_steps
+            if s not in ("search_products", "search_accessories", "generate_custom_design")
+        ]
 
     # CRITICAL GUARD: Negotiation / discount is ONLY valid when a product is actually selected!
     # If no product is selected yet, price-conscious phrases ("normal batao", "zada expensive nhi", "sasta") are budget guidance for search.
@@ -2011,6 +2432,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
                 skip_search.add("search_fabrics")
             required_steps = [s for s in required_steps if s not in skip_search]
 
+    fabric_path = intent == "fabric_custom" or "search_fabrics" in required_steps
+
     # Hard gate: search only on dikhao/availability AND discovery prerequisites met.
     if "search_products" in required_steps and not discovery_engine.can_run_product_search(
         profile, user_message, category_variations
@@ -2021,7 +2444,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             intent = "general" if intent == "product_search" else intent
 
     # Explicit show / availability → search only when garment (+ variation) + colour/budget ready.
-    if discovery_engine.should_run_product_search(user_message):
+    # Fabric catalogue asks must not be rewritten into ready-made product_search.
+    if discovery_engine.should_run_product_search(user_message) and not fabric_path:
         # Garment named in THIS message may update type; never invent from event alone.
         named_garment = _message_explicitly_names_garment(user_message, catalog_categories)
         if named_garment:
@@ -2058,7 +2482,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         or _extract_explicit_color(user_message)
     )
     if (
-        state.get("event_type")
+        not fabric_path
+        and state.get("event_type")
         and state.get("sales_stage") == "discovery"
         and (has_new_concrete_preference or is_seeking_guidance or discovery_engine.should_run_product_search(user_message))
         and discovery_engine.can_run_product_search(profile, user_message, category_variations)
@@ -2067,7 +2492,7 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             required_steps = list(dict.fromkeys([*required_steps, "search_products"]))
         sales_stage = "recommendation"
         intent = "product_search"
-    elif is_seeking_guidance and not state.get("selected_product_id"):
+    elif not fabric_path and is_seeking_guidance and not state.get("selected_product_id"):
         # Customer asking for guidance / suggestions: show top recommendations!
         if (state.get("event_type") or plan.get("event_type")):
             if "search_products" not in required_steps:
@@ -2075,6 +2500,49 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             sales_stage = "recommendation"
             intent = "product_search"
 
+    # Re-assert fabric path after product-search heuristics (available/suggest words collide).
+    # Do NOT re-force search_fabrics when the customer is choosing an already-listed fabric.
+    if fabric_path and not _is_fabric_choose_message(user_message):
+        intent = "fabric_custom"
+        if "search_fabrics" not in required_steps:
+            required_steps = list(dict.fromkeys([*required_steps, "search_fabrics"]))
+        required_steps = [s for s in required_steps if s not in ("search_products",)]
+        sales_stage = "recommendation"
+        # Nikah/Barat → Sherwani fabrics; Walima → Suits — never dump wrong dress_category.
+        if not (plan.get("product_type") or state.get("product_type") or resolved_product_type):
+            inferred = _default_category_for_event(
+                plan.get("event_type") or state.get("event_type")
+            )
+            if inferred:
+                resolved = resolve_category_against_catalog(inferred, catalog_categories) or inferred
+                plan["product_type"] = resolved
+                profile_dict["product_type"] = resolved
+                resolved_product_type = resolved
+    elif _is_fabric_choose_message(user_message):
+        intent = "custom_design"
+        required_steps = [s for s in required_steps if s not in ("search_fabrics", "search_products")]
+        sales_stage = "customization"
+
+
+    # Context lock: once a piece is selected, follow-ups (like / colour / discount)
+    # must NOT restart a catalog carousel unless the customer explicitly asks to browse.
+    explicit_catalog_ask = discovery_engine.customer_asked_for_catalog(user_message) and not _is_like_confirm(
+        user_message
+    )
+    selected_already = bool(state.get("selected_product_id") or plan.get("selected_product_id"))
+    if selected_already and not explicit_catalog_ask:
+        if (
+            awaiting_color
+            or _in_active_negotiation(state)
+            or _is_like_confirm(user_message)
+            or sales_stage == "negotiation"
+            or "calculate_negotiation_offer" in required_steps
+        ):
+            required_steps = [s for s in required_steps if s != "search_products"]
+            if "calculate_negotiation_offer" in required_steps or awaiting_color:
+                sales_stage = "negotiation"
+                intent = "discount_request"
+                session_products = []
 
     if "search_accessories" in required_steps or intent == "accessories_search":
         sales_stage = "recommendation"
@@ -2163,12 +2631,24 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     checkout_hand_off_note = None
     product_variation_note = None
     product_interest_note = None
+    suppress_product_ui = False
     selected_product_id = plan.get("selected_product_id") or state.get("selected_product_id")
     # Matching pool = current + history; response products stay current turn only
     # (search_products overwrites when it runs).
     known_products = _collect_known_products(state)
     if sales_stage != "negotiation":
         session_products = list(state.get("products") or [])
+    else:
+        session_products = []
+    # Pure category browse ("suits dikhao") must show many cards — never lock first SKU.
+    if (
+        discovery_engine.customer_asked_for_catalog(user_message)
+        and "search_products" in required_steps
+        and not _match_product_from_message(user_message, known_products or session_products)
+    ):
+        required_steps = [s for s in required_steps if s != "get_product_details"]
+        selected_product_id = None
+        plan["selected_product_id"] = None
     confirm_color = plan.get("color") or stated_color
     product_details_state = state.get("product_details") if isinstance(state.get("product_details"), dict) else {}
     if isinstance(product_details_state, dict) and product_details_state.get("error"):
@@ -2178,8 +2658,19 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         or (product_details_state or {}).get("variations")
         or []
     )
-    selected_product_variation_id = state.get("selected_product_variation_id")
-    selected_product_variation_name = state.get("selected_product_variation_name")
+    profile_src = state.get("customer_profile") if isinstance(state.get("customer_profile"), dict) else {}
+    selected_product_variation_id = (
+        state.get("selected_product_variation_id")
+        or profile_src.get("selected_product_variation_id")
+    )
+    selected_product_variation_name = (
+        state.get("selected_product_variation_name")
+        or profile_src.get("selected_product_variation_name")
+    )
+    if not selected_variation_id:
+        selected_variation_id = profile_src.get("selected_variation_id") or selected_variation_id
+    if not selected_variation_name:
+        selected_variation_name = profile_src.get("selected_variation_name") or selected_variation_name
 
     # Prefer naming a listed product ("Blue Nawab is nice") over colour/id alone.
     named_product = _match_product_from_message(user_message, known_products or session_products)
@@ -2189,14 +2680,19 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             confirm_color = None
             plan["color"] = None
 
-    # Case 1: match a product-level variation from this message (or prior category pick).
+    # Case 1: match a product-level variation from THIS message only.
+    # Do not re-treat a leftover selected_variation_name as a new pick — that
+    # was restarting the catalog card on "pasand" / colour follow-ups.
     matched_product_variation = resolve_variation_against_catalog(
         user_message,
         product_variations,
     )
-    if not matched_product_variation and selected_variation_name:
+    variation_picked_this_turn = bool(matched_product_variation)
+    if not matched_product_variation and (
+        selected_product_variation_name or selected_variation_name
+    ):
         matched_product_variation = resolve_variation_against_catalog(
-            selected_variation_name,
+            str(selected_product_variation_name or selected_variation_name),
             product_variations,
         )
     if matched_product_variation:
@@ -2233,8 +2729,11 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     )
     if (
         selected_product_id
+        and variation_picked_this_turn
         and matched_product_variation
         and product_variations
+        and not awaiting_color
+        and "calculate_negotiation_offer" not in required_steps
         and not needs_product_variation_choice(
             product_variations,
             selected_product_variation_id,
@@ -2261,45 +2760,30 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         # Guide LLM to confirm variation selection with details
         product_interest_note = (
             f"Customer chose variation {selected_product_variation_name}. "
-            "Confirm briefly with name/price. Do NOT give product_url yet. "
-            "Invite price discussion if needed; checkout link only when they say buy/checkout."
+            "Confirm briefly with name/price. Do NOT re-show catalog options. "
+            "Do NOT give product_url yet. Invite price discussion or checkout when they say buy."
         )
         if wants_checkout:
-            product_url = (
-                (product_details_state or {}).get("product_url")
-                or next(
-                    (
-                        str(p.get("product_url"))
-                        for p in (state.get("products") or [])
-                        if str(p.get("product_id")) == str(selected_product_id) and p.get("product_url")
-                    ),
-                    "",
-                )
-            )
             buying_intent = "ready_to_buy"
             profile.buying_intent = "ready_to_buy"  # type: ignore[assignment]
-            checkout_hand_off_note = _build_checkout_hand_off_note(
-                product_url=product_url,
-                variation_name=selected_product_variation_name,
-                negotiated=bool(state.get("negotiation_result")),
-            )
+            checkout_hand_off_note = None
             product_interest_note = None
             if "close_sale" not in required_steps:
                 required_steps = list(dict.fromkeys([*required_steps, "close_sale"]))
         else:
             checkout_hand_off_note = None
 
-    elif (shows_interest or wants_checkout or asks_variation) and (known_products or session_products or selected_product_id):
+    elif (
+        not awaiting_color
+        and "calculate_negotiation_offer" not in required_steps
+        and (shows_interest or wants_checkout or asks_variation or _is_like_confirm(user_message))
+        and (known_products or session_products or selected_product_id)
+    ):
         chosen = named_product or _pick_confirmed_product(
             session_products or known_products, selected_product_id, confirm_color
         )
         if chosen:
             selected_product_id = str(chosen.get("product_id") or selected_product_id or "")
-            product_url = (
-                (product_details_state or {}).get("product_url")
-                or chosen.get("product_url")
-                or ""
-            )
             if chosen.get("variations"):
                 product_variations = list(chosen.get("variations") or product_variations)
             if "get_product_details" not in required_steps:
@@ -2354,22 +2838,32 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
                 )
                 checkout_hand_off_note = None
             elif wants_checkout:
-                checkout_hand_off_note = _build_checkout_hand_off_note(
-                    product_url=product_url,
-                    product_name=str(chosen.get("name") or ""),
-                    variation_name=selected_product_variation_name,
-                    color=confirm_color,
-                    negotiated=bool(state.get("negotiation_result")),
-                )
+                checkout_hand_off_note = None
                 if "close_sale" not in required_steps:
                     required_steps = list(dict.fromkeys([*required_steps, "close_sale"]))
             else:
-                # Liked piece — hold for details / negotiation; URL only at the end.
+                # Liked / colour-confirmed the selected piece — talk, do not re-render cards.
+                liked_already = _is_like_confirm(user_message) or bool(named_product)
                 product_interest_note = _build_product_interest_note(
                     product_name=str(chosen.get("name") or ""),
                     needs_variation=False,
+                    advance_close=bool(liked_already and not needs_var),
                 )
                 checkout_hand_off_note = None
+                suppress_product_ui = True
+                # Keep stage on detail — "closing" makes the widget flash a checkout CTA too early.
+                sales_stage = "detail"
+                buying_intent = "considering" if not wants_checkout else "ready_to_buy"
+                profile.buying_intent = buying_intent  # type: ignore[assignment]
+                profile.sales_stage = "detail"  # type: ignore[assignment]
+                details_ready = (
+                    isinstance(product_details_state, dict)
+                    and product_details_state
+                    and not product_details_state.get("error")
+                    and str(product_details_state.get("product_id") or "") == str(selected_product_id)
+                )
+                if details_ready:
+                    required_steps = [s for s in required_steps if s != "get_product_details"]
             
             # CRITICAL: Clear products list when customer shows interest in ONE specific product
             # (prevents showing old product carousel when only selected product details should appear)
@@ -2425,18 +2919,46 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     )
 
     cut_style = plan.get("cut_style") or state.get("cut_style") or _extract_cut_style(user_message)
+    # Map common design preferences onto catalogue product_type when missing.
+    if cut_style and not (plan.get("product_type") or state.get("product_type")):
+        cut_to_type = {
+            "Sherwani": "Sherwani",
+            "Angrakha": "Sherwani",
+            "Achkan": "Sherwani",
+            "Bandhgala": "Prince Coat",
+            "Prince Coat": "Prince Coat",
+            "Tuxedo": "Suits",
+            "Three Piece": "Suits",
+            "Two Piece": "Suits",
+            "Double Breasted": "Suits",
+            "Kurta": "Kurta",
+        }
+        mapped = cut_to_type.get(cut_style)
+        if mapped:
+            plan["product_type"] = mapped
     selected_fabric_code = state.get("selected_fabric_catalog_code")
     matched_fabric = _match_fabric_from_message(user_message, state.get("fabrics") or [])
     if matched_fabric:
         selected_fabric_code = matched_fabric.get("catalog_code") or selected_fabric_code
     
     # Check if user wants customization
+    fabric_just_chosen = bool(matched_fabric) or _is_fabric_choose_message(user_message)
     in_custom_flow = (
         any(cue in user_message.lower() for cue in _customization_cues)
         or intent in ("custom_design", "custom_product_variation")
         or bool(state.get("customization_stage"))
+        or bool(state.get("selected_fabric_catalog_code"))
+        or fabric_just_chosen
         or _has_custom_image(state)
     )
+    # Colour answers during negotiation are NOT bespoke redesigns.
+    if awaiting_color or "calculate_negotiation_offer" in required_steps:
+        in_custom_flow = False
+    # Short like/colour confirm of a selected piece is not a custom request.
+    if selected_product_id and _is_like_confirm(user_message) and not any(
+        cue in user_message.lower() for cue in _customization_cues
+    ) and not fabric_just_chosen:
+        in_custom_flow = False
     
     # CRITICAL: When customizing a specific product ("customize RIVIERA using this fabric"),
     # extract fabric FROM that product if not already selected
@@ -2451,18 +2973,22 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
                 state.get("session_id"),
             )
     
-    # CRITICAL: Recalculate has_details AFTER fabric extraction
-    # (fabric might have been extracted from base_prod above)
-    if in_custom_flow and selected_fabric_code:
+    # Path B (selected product): fabric alone can count as concrete specs.
+    # Path A (fabric-first, no product): fabric choose is NOT enough — still need design preference.
+    if in_custom_flow and selected_product_id and selected_fabric_code:
         has_details = _has_customization_details(
             user_message,
             selected_product_id,
             selected_fabric_code,
             base_product=base_prod,
         )
+    elif in_custom_flow and not selected_product_id:
+        # Path A: ready to generate only when fabric + design preference (cut / garment) exist.
+        has_details = bool(selected_fabric_code and (cut_style or plan.get("product_type") or state.get("product_type")))
     
     customization_stage = state.get("customization_stage")
     customization_note = None
+    wants_revision = _is_design_revision_request(user_message)
 
     if in_custom_flow:
         if selected_product_id:
@@ -2474,10 +3000,13 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         session_products = []
         # Remove search_products from required_steps — we're customizing, not browsing
         required_steps = [s for s in required_steps if s != "search_products"]
+        # Fabric card Choose is a selection, not another fabric browse.
+        if fabric_just_chosen or selected_fabric_code:
+            required_steps = [s for s in required_steps if s != "search_fabrics"]
 
-        if has_details:
+        if has_details or wants_revision:
             if "generate_custom_design" not in required_steps:
-                if selected_product_id and "get_product_details" not in required_steps:
+                if selected_product_id and "get_product_details" not in required_steps and not wants_revision:
                     required_steps = ["get_product_details", "generate_custom_design"]
                 else:
                     required_steps = list(dict.fromkeys([*required_steps, "generate_custom_design"]))
@@ -2497,28 +3026,73 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             cut_style=cut_style,
             selected_fabric_code=selected_fabric_code,
             fabrics=list(state.get("fabrics") or []),
+            wants_revision=wants_revision,
         )
         if customization_note:
             variation_note = customization_note
+            product_variation_note = customization_note
 
-    if not has_details and "generate_custom_design" in required_steps:
+    if not has_details and not wants_revision and "generate_custom_design" in required_steps:
         required_steps = [s for s in required_steps if s != "generate_custom_design"]
 
     already_measured = measurements_complete(state)
     pending_measurement = (state.get("measurement_result") or {}).get("status") == "pending"
-    wants_measurement = bool(
-        infer_measurement_path(user_message, state.get("size_chart"))
-        or customization_stage == "measurements"
-        or pending_measurement
+    likes_bespoke = bool(
+        _has_custom_image(state)
+        and _is_like_confirm(user_message)
+        and not wants_revision
+        and not _is_design_revision_request(user_message)
     )
-    if not already_measured:
-        if _has_custom_image(state) or customization_stage == "measurements":
-            required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
-            required_steps = [s for s in required_steps if s != "generate_custom_design"]
-        elif buying_intent == "ready_to_buy" and selected_product_id:
-            required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
-        elif wants_measurement:
-            required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
+    # Bespoke mockup approved → checkout directly (size/measurements are on checkout page).
+    if likes_bespoke or (
+        _has_custom_image(state)
+        and _is_explicit_checkout_request(user_message)
+        and not wants_revision
+    ):
+        required_steps = [
+            s
+            for s in required_steps
+            if s
+            not in (
+                "collect_measurements",
+                "validate_measurements",
+                "generate_custom_design",
+                "search_fabrics",
+                "search_products",
+            )
+        ]
+        if "close_sale" not in required_steps:
+            required_steps = list(dict.fromkeys([*required_steps, "close_sale"]))
+        intent = "closing"
+        sales_stage = "closing"
+        buying_intent = "ready_to_buy"
+        customization_stage = "checkout"
+        variation_note = (
+            "Customer approved the bespoke design. Hand them to secure checkout now. "
+            "Do NOT ask for size or body measurements in chat."
+        )
+        product_variation_note = variation_note
+    else:
+        wants_measurement = bool(
+            infer_measurement_path(user_message, state.get("size_chart"))
+            or pending_measurement
+        )
+        if not already_measured:
+            # Design revision must regenerate first — do not divert to measurements this turn.
+            if wants_revision and "generate_custom_design" in required_steps:
+                required_steps = [s for s in required_steps if s != "collect_measurements"]
+            elif _has_custom_image(state) and not wants_revision:
+                # Never auto-open measurement collection after a bespoke image —
+                # checkout page owns size/naap. Only collect if they typed measurements.
+                required_steps = [
+                    s for s in required_steps if s not in ("collect_measurements", "validate_measurements")
+                ]
+                if wants_measurement and infer_measurement_path(user_message, state.get("size_chart")):
+                    required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
+            elif buying_intent == "ready_to_buy" and selected_product_id:
+                required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
+            elif wants_measurement:
+                required_steps = _insert_step(required_steps, "collect_measurements", before="close_sale")
 
     # Named / selected piece detail ask: never re-run catalog search.
     # FE expects product_details + empty products (no carousel under the detail card).
@@ -2551,6 +3125,32 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
                 "Present that piece only (name, price, fabric, colors, sizes, product variations). "
                 "Do NOT list other catalog options or say 'here are our options'."
             )
+
+    if selected_product_id:
+        profile.selected_product_id = selected_product_id
+        profile_dict["selected_product_id"] = selected_product_id
+
+    if selected_fabric_code:
+        profile.selected_fabric_catalog_code = selected_fabric_code
+        profile_dict["selected_fabric_catalog_code"] = selected_fabric_code
+    if cut_style:
+        profile_dict["cut_style"] = cut_style
+    if customization_stage:
+        profile_dict["customization_stage"] = customization_stage
+    profile_dict["sales_stage"] = sales_stage
+    # Refresh profile model after fabric/cut updates
+    try:
+        profile = CustomerProfileSchema(**{**profile.model_dump(), **{
+            k: profile_dict[k]
+            for k in (
+                "selected_product_id",
+                "selected_fabric_catalog_code",
+                "sales_stage",
+            )
+            if k in profile_dict
+        }})
+    except Exception:
+        pass
 
     result = {
         "messages": [{"role": "user", "content": user_message}],
@@ -2609,6 +3209,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         "category_variations": summarize_variations_for_prompt(category_variations),
         "discovery_next_slot": next_gap[0] if next_gap else None,
         "checkout_hand_off_note": checkout_hand_off_note,
+        "product_interest_note": product_interest_note,
+        "suppress_product_ui": suppress_product_ui,
         "catalog_search_note": variation_note or state.get("catalog_search_note"),
         "wants_more_options": wants_more_options,
     }
@@ -2723,14 +3325,8 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
             user_message,
             state.get("catalog_categories") or [],
         )
-    if not product_type and state.get("event_type"):
-        ev = str(state.get("event_type")).lower()
-        if any(x in ev for x in ("barat", "nikah", "nikkah")):
-            product_type = "Sherwani"
-        elif any(x in ev for x in ("walima", "valima")):
-            product_type = "Suits"
-        elif any(x in ev for x in ("mehndi", "mehendi")):
-            product_type = "Sherwani"
+    if not product_type:
+        product_type = _default_category_for_event(state.get("event_type"))
 
     product_type = resolve_category_against_catalog(
         product_type,
@@ -2753,7 +3349,11 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
     profile_dict = dict(state.get("customer_profile") or {})
     profile_dict["session_id"] = state.get("session_id", "default")
     event_type = state.get("event_type")
-    season = profile_dict.get("derived_season") or state.get("season")
+    season = map_season_for_catalog_api(
+        profile_dict.get("derived_season")
+        or state.get("season")
+        or derive_season_from_text(user_message)
+    )
     fabric = state.get("selected_fabric_catalog_code") or state.get("fabric")
     catalog_categories = state.get("catalog_categories") or []
     budget = state.get("budget")
@@ -3179,59 +3779,314 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
     }
 
 
+def _fabric_matches_category(fabric: dict[str, Any], want: str) -> bool:
+    want_l = want.lower()
+    cats = fabric.get("dress_category") or fabric.get("category")
+    if isinstance(cats, list) and cats:
+        return any(want_l in str(c).lower() for c in cats)
+    if cats and want_l in str(cats).lower():
+        return True
+    return False
+
+
+def _fabric_season_list(fabric: dict[str, Any]) -> list[str]:
+    seasons = fabric.get("seasons") if isinstance(fabric.get("seasons"), list) else None
+    if seasons:
+        return [str(s).strip() for s in seasons if str(s).strip()]
+    raw = str(fabric.get("season") or "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in re.split(r"\s*,\s*", raw) if part.strip()]
+
+
+def _fabric_matches_season(fabric: dict[str, Any], season_label: str | None) -> bool:
+    """True only if fabric is tagged for the requested catalogue season (or All Season)."""
+    if not season_label:
+        return True
+    want = season_label.lower()
+    labels = [s.lower() for s in _fabric_season_list(fabric)]
+    if not labels:
+        return False  # unknown season — do not guess into a summer/winter ask
+    if any("all season" in s for s in labels):
+        return True
+    if any(want == s or want in s or s in want for s in labels):
+        return True
+    if "summer" in want or "spring" in want:
+        return any("summer" in s or "spring" in s for s in labels)
+    if "winter" in want or "autumn" in want:
+        return any("winter" in s or "autumn" in s for s in labels)
+    return False
+
+
+def _align_fabric_season_display(
+    fabric: dict[str, Any],
+    season_label: str | None,
+) -> dict[str, Any]:
+    """
+    Dual-season rows often list Autumn/Winter first; FE badges use the first tag.
+    For a summer ask, put Spring / Summer (or All Season) first so the card matches the request.
+    """
+    if not season_label or not isinstance(fabric, dict):
+        return fabric
+    labels = _fabric_season_list(fabric)
+    if not labels:
+        return fabric
+    want = season_label.lower()
+    preferred: list[str] = []
+    rest: list[str] = []
+    for label in labels:
+        low = label.lower()
+        hit = (
+            want == low
+            or want in low
+            or low in want
+            or ("summer" in want and "summer" in low)
+            or ("spring" in want and "spring" in low)
+            or ("winter" in want and "winter" in low)
+            or ("autumn" in want and "autumn" in low)
+            or "all season" in low
+        )
+        (preferred if hit else rest).append(label)
+    if not preferred:
+        return fabric
+    ordered = preferred + rest
+    out = dict(fabric)
+    out["seasons"] = ordered
+    out["season"] = ordered[0]  # FE badge — show the season the customer asked for
+    return out
+
+
+def _fabric_season_sort_key(fabric: dict[str, Any], season_label: str | None) -> tuple[int, str]:
+    """Prefer rows whose primary season matches the ask, then All Season, then dual."""
+    name = str(fabric.get("name") or "")
+    if not season_label:
+        return (2, name)
+    labels = [s.lower() for s in _fabric_season_list(fabric)]
+    want = season_label.lower()
+    if labels and (want in labels[0] or labels[0] in want):
+        return (0, name)
+    if any("all season" in s for s in labels):
+        return (1, name)
+    return (2, name)
+
+
+def _fabric_matches_color(fabric: dict[str, Any], color: str | None) -> bool:
+    if not color:
+        return True
+    want = color.lower().strip()
+    colors = [str(c).lower() for c in (fabric.get("available_colors") or []) if str(c).strip()]
+    primary = str(fabric.get("color") or fabric.get("primary_color") or "").lower()
+    name = str(fabric.get("name") or "").lower()
+    if want in colors or want == primary or want in name:
+        return True
+    # soft: "grey" ↔ "gray", partial token
+    return any(want in c or c in want for c in colors)
+
+
 @log_node_payload("search_fabrics_node")
 async def search_fabrics_node(state: SalesAgentState) -> dict[str, Any]:
     logger.info("search_fabrics_node start session_id=%s", state.get("session_id"))
     profile_dict = dict(state.get("customer_profile") or {})
-    try:
-        fabrics = await search_fabrics.ainvoke({
-            "fabric_type": (profile_dict.get("preferred_fabrics") or [None])[0],
-            "color": state.get("color"),
-            "category": state.get("product_type"),
-            "season": str(profile_dict.get("derived_season")).title()
-            if profile_dict.get("derived_season")
-            else None,
-            "limit": MAX_PRODUCTS_TO_SHOW or 50,
+    user_message = state.get("user_message") or ""
+    # Season from month/date already on profile, or derive from wedding_date / message.
+    derived = profile_dict.get("derived_season") or derive_season_from_text(
+        state.get("wedding_date") or profile_dict.get("wedding_date")
+    )
+    if not derived:
+        derived = derive_season_from_text(user_message)
+    if derived and not profile_dict.get("derived_season"):
+        profile_dict["derived_season"] = derived
+    season_filter = map_season_for_catalog_api(derived)
+
+    # Colour: explicit in this message, else session/profile (same idea as products).
+    color_filter = _extract_explicit_color(user_message) or state.get("color") or profile_dict.get("color")
+    if color_filter:
+        color_filter = str(color_filter).strip().title()
+        profile_dict["color"] = color_filter
+
+    preferred = profile_dict.get("preferred_fabrics") or []
+    fabric_type = preferred[0] if isinstance(preferred, list) and preferred else None
+
+    # Filter fabrics by garment category for the event (Nikah → Sherwani, not Suits).
+    event_type = state.get("event_type") or profile_dict.get("event_type")
+    product_type = state.get("product_type") or profile_dict.get("product_type")
+    if not product_type:
+        product_type = _message_explicitly_names_garment(
+            user_message,
+            state.get("catalog_categories") or [],
+        )
+    if not product_type:
+        product_type = _default_category_for_event(event_type)
+    product_type = resolve_category_against_catalog(
+        product_type,
+        state.get("catalog_categories") or [],
+    ) or product_type
+    if product_type:
+        profile_dict["product_type"] = product_type
+
+    async def _fetch(**overrides: Any) -> list[dict[str, Any]]:
+        payload = {
+            "fabric_type": fabric_type,
+            "color": color_filter,
+            "category": product_type,
+            "season": season_filter,
+            "limit": 100,
             "offset": 0,
-        })
+        }
+        payload.update(overrides)
+        return list(await search_fabrics.ainvoke(payload) or [])
+
+    widened_drops: list[str] = []
+    try:
+        fabrics = await _fetch()
     except Exception:
         logger.exception("search_fabrics_node failed session_id=%s", state.get("session_id"))
         raise
 
-    fabrics = list(fabrics or [])
-    if MAX_PRODUCTS_TO_SHOW:
-        fabrics = fabrics[:MAX_PRODUCTS_TO_SHOW]
-    path_a_fabric = (
-        state.get("customization_stage") == "fabric_selection"
-        or (state.get("sales_stage") == "customization" and not state.get("selected_product_id"))
-    )
-    # Path A: show options — do not auto-pick the first swatch.
-    selected_code = None if path_a_fabric else (fabrics[0].get("catalog_code") if fabrics else None)
+    # Empty-only widen (same ladder idea as products): relax one filter at a time.
+    if not fabrics and season_filter:
+        try:
+            fabrics = await _fetch(season=None)
+            if fabrics:
+                widened_drops.append("season")
+                fabrics = [f for f in fabrics if isinstance(f, dict) and _fabric_matches_season(f, season_filter)]
+        except Exception:
+            logger.exception("search_fabrics_node season widen failed")
+    if not fabrics and color_filter:
+        try:
+            fabrics = await _fetch(color=None, season=season_filter)
+            if fabrics:
+                widened_drops.append("color")
+                fabrics = [f for f in fabrics if isinstance(f, dict) and _fabric_matches_color(f, color_filter)]
+        except Exception:
+            logger.exception("search_fabrics_node color widen failed")
+    if not fabrics and product_type:
+        try:
+            fabrics = await _fetch(category=None, season=season_filter, color=color_filter)
+            if fabrics:
+                widened_drops.append("category")
+        except Exception:
+            logger.exception("search_fabrics_node category widen failed")
+
+    # Hard filter: when we know the garment/event category, NEVER keep wrong-category rows
+    # (unless we deliberately widened past category).
+    if product_type and fabrics and "category" not in widened_drops:
+        before = len(fabrics)
+        fabrics = [
+            f for f in fabrics
+            if isinstance(f, dict) and _fabric_matches_category(f, product_type)
+        ]
+        logger.info(
+            "search_fabrics_node category hard-filter %s → kept=%s dropped=%s",
+            product_type,
+            len(fabrics),
+            before - len(fabrics),
+        )
+    if season_filter and fabrics:
+        # Always enforce season client-side — API dual-tags can still include winter-only noise.
+        before = len(fabrics)
+        fabrics = [
+            f for f in fabrics if isinstance(f, dict) and _fabric_matches_season(f, season_filter)
+        ]
+        logger.info(
+            "search_fabrics_node season hard-filter %s → kept=%s dropped=%s",
+            season_filter,
+            len(fabrics),
+            before - len(fabrics),
+        )
+    if color_filter and fabrics and "color" not in widened_drops:
+        fabrics = [f for f in fabrics if isinstance(f, dict) and _fabric_matches_color(f, color_filter)]
+
+    if season_filter and fabrics:
+        fabrics = [_align_fabric_season_display(f, season_filter) for f in fabrics]
+        fabrics.sort(key=lambda f: _fabric_season_sort_key(f, season_filter))
+
+    catalog_search_note = None
+    if fabrics and widened_drops:
+        catalog_search_note = (
+            f"Exact fabric filter was empty; widened by relaxing: {', '.join(widened_drops)}. "
+            f"SHORT REPLY: ONE line — here are {len(fabrics)} fabric swatch(es) "
+            f"(season={season_filter or 'any'}, colour={color_filter or 'any'}). "
+            "Frontend cards show the swatches. Do NOT invent fabric names."
+        )
+    elif not fabrics:
+        event_label = event_type or "this event"
+        cat_bit = f" for '{product_type}'" if product_type else ""
+        season_bit = f", season {season_filter}" if season_filter else ""
+        color_bit = f", colour {color_filter}" if color_filter else ""
+        catalog_search_note = (
+            f"No live fabric swatches matched{cat_bit}{season_bit}{color_bit} "
+            f"(event: {event_label}). "
+            "Honestly tell the customer those swatches are not listed yet. "
+            "Offer: (1) browse ready-made catalogue pieces, "
+            "(2) share a fabric photo / preference for Style Consultant sourcing, "
+            "or (3) try another season/colour. Stay in the customer's language. "
+            "One short polite reply — no invented fabric names."
+        )
+        logger.info(
+            "search_fabrics_node empty category=%s event=%s season=%s color=%s",
+            product_type,
+            event_type,
+            season_filter,
+            color_filter,
+        )
+
+    # Never auto-pick a fabric on browse — customer / frontend chooses.
+    selected_code = state.get("selected_fabric_catalog_code")
     profile_dict["session_id"] = state.get("session_id", "default")
     if selected_code:
         profile_dict["selected_fabric_catalog_code"] = selected_code
-    profile_dict["sales_stage"] = "customization" if path_a_fabric else "recommendation"
+    # Pure fabric browse stays on recommendation so product UI suppress does not hide swatches.
+    in_custom_flow = (
+        state.get("sales_stage") == "customization"
+        or state.get("customization_stage")
+        or bool(state.get("selected_product_id"))
+    )
+    next_stage = "customization" if in_custom_flow else "recommendation"
+    profile_dict["sales_stage"] = next_stage
 
     logger.info(
-        "search_fabrics_node finish session_id=%s fabric_count=%s selected=%s path_a=%s",
+        "search_fabrics_node finish session_id=%s fabric_count=%s season=%s color=%s "
+        "category=%s selected=%s",
         state.get("session_id"),
         len(fabrics),
+        season_filter,
+        color_filter,
+        product_type,
         selected_code,
-        path_a_fabric,
     )
-    return {
+    out: dict[str, Any] = {
         "fabrics": fabrics,
-        "selected_fabric_catalog_code": selected_code or state.get("selected_fabric_catalog_code"),
-        "sales_stage": "customization" if path_a_fabric else "recommendation",
-        "customization_stage": "fabric_selection" if path_a_fabric else state.get("customization_stage"),
+        "selected_fabric_catalog_code": selected_code,
+        "sales_stage": next_stage,
+        "customization_stage": "fabric_selection",
+        "product_type": product_type,
+        "wedding_date": state.get("wedding_date") or profile_dict.get("wedding_date"),
+        "color": color_filter,
+        "catalog_search_note": catalog_search_note or state.get("catalog_search_note"),
         "customer_profile": profile_dict,
         "style_context": [
             {
                 "fabric_custom": True,
-                "rule": "Never invent fabric price, meters, or weight. Hand pricing/yardage to a consultant.",
+                "rule": (
+                    "Never invent fabric names, prices, meters, or weight. "
+                    "Only discuss fabrics returned in context.fabrics. "
+                    "If fabrics is empty, follow catalog_search_note — do not offer Suit fabrics for Nikah/Sherwani. "
+                    "When context.price_quote.ok and source=calculator, quote list_price/unit_price in GBP only — "
+                    "never floor_price, markup, or invented figures."
+                ),
             }
         ],
     }
+    if selected_code:
+        quote_patch = await _refresh_price_quote({**dict(state), **out})
+        out.update(quote_patch)
+        if quote_patch.get("customer_profile"):
+            out["customer_profile"] = {
+                **profile_dict,
+                **quote_patch["customer_profile"],
+            }
+    return out
 
 
 @log_node_payload("get_product_details_node")
@@ -3314,11 +4169,20 @@ async def get_product_details_node(state: SalesAgentState) -> dict[str, Any]:
         "selected_product_id": product_id,
         "product_variations": summarize_product_variations_for_prompt(product_variations),
     }
-    # Detail focus: do not keep / append carousel candidates under the detail card.
+    # Detail / confirm / negotiation: never append a carousel row under the selected piece.
     stage = (state.get("sales_stage") or "").lower()
-    if stage == "detail" or _is_product_detail_request(user_msg):
+    confirm_turn = (
+        stage in ("detail", "closing", "negotiation")
+        or _is_product_detail_request(user_msg)
+        or _is_like_confirm(user_msg)
+        or _is_piece_or_colour_confirm(user_msg)
+        or _negotiation_awaiting_color(state)
+        or bool(state.get("product_interest_note"))
+    )
+    if confirm_turn:
         out["products"] = []
-        out["sales_stage"] = "detail"
+        if stage != "negotiation":
+            out["sales_stage"] = "detail" if stage != "closing" else stage
     else:
         cur_products = list(state.get("products") or [])
         if details and not any(str(p.get("product_id") or p.get("id")) == str(product_id) for p in cur_products):
@@ -3336,19 +4200,11 @@ async def get_product_details_node(state: SalesAgentState) -> dict[str, Any]:
         # Customer has chosen a variation — no need to show selector again
         out["product_variations"] = []
         out["sales_stage"] = "detail"
-        # Checkout URL only on explicit buy/checkout — never on mere interest.
+        # Checkout URL only from close_sale_node — never catalog product_url.
         if state.get("checkout_hand_off_note") or _is_explicit_checkout_request(user_message):
-            product_url = details.get("product_url") or ""
-            out["checkout_hand_off_note"] = _build_checkout_hand_off_note(
-                product_url=product_url,
-                product_name=str(details.get("name") or ""),
-                variation_name=selected_pv_name,
-                negotiated=bool(state.get("negotiation_result")),
-            )
             out["product_variation_note"] = None
             out["product_interest_note"] = None
         elif state.get("product_interest_note") or _is_piece_or_colour_confirm(user_message):
-            out["checkout_hand_off_note"] = None
             out["product_interest_note"] = state.get("product_interest_note") or _build_product_interest_note(
                 product_name=str(details.get("name") or ""),
                 needs_variation=False,
@@ -3624,7 +4480,7 @@ async def suggest_cross_sell_node(state: SalesAgentState) -> dict[str, Any]:
 @log_node_payload("close_sale_node")
 async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
     """
-    Final close: hand product_url for self-checkout (after interest + optional negotiation).
+    Final close: POST sales-agent checkout and share the returned checkout_url.
     """
     logger.info("close_sale_node start %s", _log_state_summary(state))
     contact = state.get("customer_contact") or {}
@@ -3636,17 +4492,20 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
     if not product_id and products:
         product_id = (products[0] or {}).get("product_id")
 
-    product_url = ""
     product_name = None
     if isinstance(details, dict):
-        product_url = str(details.get("product_url") or "")
         product_name = details.get("name")
-    if not product_url:
+    if not product_name:
         for p in products:
-            if str(p.get("product_id")) == str(product_id) and p.get("product_url"):
-                product_url = str(p.get("product_url"))
-                product_name = product_name or p.get("name")
+            if str(p.get("product_id")) == str(product_id) and p.get("name"):
+                product_name = p.get("name")
                 break
+    custom = state.get("custom_design_result") if isinstance(state.get("custom_design_result"), dict) else {}
+    product_name = (
+        (custom.get("generated_product_name") or custom.get("base_product_name") or product_name)
+        if custom
+        else product_name
+    )
 
     negotiation = state.get("negotiation_result") if isinstance(state.get("negotiation_result"), dict) else {}
     offered = negotiation.get("offered_price")
@@ -3654,16 +4513,12 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
     close_result: dict[str, Any] = {
         "ready_to_close": True,
         "selected_product_id": product_id,
-        "product_url": product_url or None,
         "offered_price": offered,
         "inventory_available": inventory.get("available"),
         "low_stock": bool(inventory.get("low_stock")),
         "cta": "self_checkout_link",
         "missing_contact_fields": missing,
-        "note": (
-            "Give product_url for self-checkout. "
-            "Only ask contact if they want a consultant instead."
-        ),
+        "note": "Share the exact checkout_url from the checkout API. Do not invent a cart or catalog product_url.",
     }
 
     profile_dict = dict(state.get("customer_profile") or {})
@@ -3671,26 +4526,123 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
     profile_dict["sales_stage"] = "closing"
     profile_dict["buying_intent"] = "ready_to_buy"
 
+    checkout_url = None
+    checkout_session_id = None
     checkout_note = None
-    if product_url:
-        checkout_note = _build_checkout_hand_off_note(
-            product_url=product_url,
-            product_name=str(product_name) if product_name else None,
-            variation_name=state.get("selected_product_variation_name"),
-            color=state.get("color"),
-            negotiated=bool(offered),
+    # Always refresh calculator quote before building checkout items.
+    quote_patch = await _refresh_price_quote(dict(state))
+    state_for_checkout = {**dict(state), **quote_patch}
+    if quote_patch.get("customer_profile"):
+        profile_dict = {
+            **profile_dict,
+            **quote_patch["customer_profile"],
+        }
+        state_for_checkout["customer_profile"] = profile_dict
+    # Ensure custom checkout has a unit_price — cart shows £0 without it.
+    quote = state_for_checkout.get("price_quote") if isinstance(state_for_checkout.get("price_quote"), dict) else {}
+    custom_checkout = is_custom_checkout(state_for_checkout)
+    unit_price_ok = False
+    try:
+        unit_price_ok = bool(quote.get("ok")) and float(quote.get("unit_price") or 0) > 0
+    except (TypeError, ValueError):
+        unit_price_ok = False
+    if unit_price_ok:
+        logger.info(
+            "close_sale_node calculator unit_price=%s list_price=%s mode=%s",
+            quote.get("unit_price"),
+            quote.get("list_price"),
+            quote.get("customize_mode"),
         )
-        close_result["status"] = "ready_for_checkout_link"
+    elif custom_checkout:
+        logger.warning(
+            "close_sale_node CUSTOM checkout missing calculator price session_id=%s quote=%s",
+            state.get("session_id"),
+            {k: quote.get(k) for k in ("ok", "error", "source", "unit_price")} if quote else None,
+        )
+
+    payload = build_checkout_request(state_for_checkout)
+    close_result["checkout_payload"] = payload
+    if isinstance(quote, dict) and quote.get("ok"):
+        close_result["list_price"] = quote.get("list_price")
+        close_result["unit_price"] = quote.get("unit_price")
+        close_result["currency"] = quote.get("currency") or "GBP"
+
+    # Never create a CUSTOM cart session without a positive unit_price (frontend would show £0).
+    payload_unit = None
+    if payload and isinstance(payload.get("items"), list) and payload["items"]:
+        try:
+            payload_unit = float((payload["items"][0] or {}).get("unit_price") or 0)
+        except (TypeError, ValueError):
+            payload_unit = None
+    if custom_checkout and (not payload or not payload_unit or payload_unit <= 0):
+        logger.error(
+            "close_sale_node blocking CUSTOM checkout — no unit_price session_id=%s payload_unit=%s",
+            state.get("session_id"),
+            payload_unit,
+        )
+        close_result["status"] = "checkout_link_failed"
+        close_result["cta"] = None
+        close_result["note"] = (
+            "Bespoke price could not be calculated yet. Apologise briefly, ask them to confirm "
+            "the fabric and design again, then retry checkout — or connect a Style Consultant. "
+            "Do NOT invent a cart URL, catalogue product_url, or a price."
+        )
+        payload = None
+
+    if payload:
+        try:
+            api_result = await backend_api.create_checkout_session(payload)
+        except BackendAPIError:
+            logger.exception(
+                "close_sale_node checkout API failed session_id=%s",
+                state.get("session_id"),
+            )
+            api_result = {"success": False}
+        except Exception:
+            logger.exception(
+                "close_sale_node checkout unexpected error session_id=%s",
+                state.get("session_id"),
+            )
+            api_result = {"success": False}
+        checkout_url = api_result.get("checkout_url") if isinstance(api_result, dict) else None
+        checkout_session_id = api_result.get("session_id") if isinstance(api_result, dict) else None
+        if checkout_url:
+            close_result["status"] = "ready_for_checkout_link"
+            close_result["checkout_url"] = checkout_url
+            close_result["checkout_session_id"] = checkout_session_id
+            checkout_note = _build_checkout_hand_off_note(
+                checkout_url=str(checkout_url),
+                product_name=str(product_name) if product_name else None,
+                variation_name=state.get("selected_product_variation_name"),
+                color=state.get("color"),
+                negotiated=bool(offered),
+            )
+        else:
+            close_result["status"] = "checkout_link_failed"
+            close_result["cta"] = None
+            close_result["note"] = (
+                "Checkout link could not be generated. Apologise briefly and offer to try again "
+                "or connect a Style Consultant. Do NOT invent a cart URL or catalog product_url."
+            )
+    elif close_result.get("status") == "checkout_link_failed":
+        # Already failed (e.g. CUSTOM without calculator unit_price) — keep that status.
+        pass
     elif missing:
         close_result["status"] = "needs_contact"
+        close_result["cta"] = None
     else:
-        close_result["status"] = "ready_for_handover"
+        close_result["status"] = "checkout_link_failed"
+        close_result["cta"] = None
+        close_result["note"] = (
+            "No checkout items were ready. Do NOT invent a cart or product_url. "
+            "Offer to confirm the piece again or connect a Style Consultant."
+        )
 
     logger.info(
         "close_sale_node finish session_id=%s status=%s has_url=%s",
         state.get("session_id"),
         close_result.get("status"),
-        bool(product_url),
+        bool(checkout_url),
     )
     return {
         "close_result": close_result,
@@ -3698,7 +4650,11 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
         "buying_intent": "ready_to_buy",
         "customer_profile": profile_dict,
         "checkout_hand_off_note": checkout_note,
-        "handover_pending": bool(missing) and not product_url,
+        "checkout_url": checkout_url,
+        "checkout_session_id": checkout_session_id,
+        "handover_pending": bool(missing) and not checkout_url,
+        "price_quote": quote_patch.get("price_quote"),
+        "customize_pricing_mode": quote_patch.get("customize_pricing_mode"),
     }
 
 
@@ -3709,16 +4665,50 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
     if not details and state.get("products"):
         details = state["products"][0]
 
+    quote_patch = await _refresh_price_quote(dict(state))
+    price_quote = quote_patch.get("price_quote") if isinstance(quote_patch.get("price_quote"), dict) else {}
     if not details:
+        details = {}
+
+    # Prefer calculator list/floor for customize / price-missing; else catalogue.
+    price = None
+    floor_override = None
+    currency = "GBP"
+    if isinstance(details, dict) and details.get("price") is not None and price_quote.get("source") != "calculator":
+        price = details.get("price")
+        floor_override = details.get("floor_price")
+        currency = details.get("currency") or "PKR"
+    elif price_quote.get("ok"):
+        price = price_quote.get("list_price") or price_quote.get("unit_price")
+        floor_override = price_quote.get("floor_price")
+        currency = price_quote.get("currency") or "GBP"
+        # Synthetic details so rest of node can run for Path A customize
+        if not details.get("product_id"):
+            details = {
+                **details,
+                "name": details.get("name")
+                or ((state.get("custom_design_result") or {}).get("generated_product_name") if isinstance(state.get("custom_design_result"), dict) else None)
+                or "Bespoke commission",
+                "category": state.get("product_type") or details.get("category"),
+                "currency": currency,
+                "price": price,
+                "floor_price": floor_override,
+            }
+
+    if price is None:
         logger.info(
-            "calculate_negotiation_offer_node finish session_id=%s no_product_selected",
+            "calculate_negotiation_offer_node finish session_id=%s no_price",
             state.get("session_id"),
         )
-        return {"negotiation_result": {"approved": False, "message": "No product selected for negotiation."}}
-
-    price = details.get("price")
-    if price is None:
-        return {"negotiation_result": {"approved": False, "message": "Product price unavailable for negotiation."}}
+        return {
+            "negotiation_result": {
+                "approved": False,
+                "message": "No product selected for negotiation."
+                if not details
+                else "Product price unavailable for negotiation.",
+            },
+            **{k: v for k, v in quote_patch.items() if k != "customer_profile"},
+        }
 
     current_neg_dict = dict(state.get("negotiation_state") or {})
     current_neg_state = NegotiationStateSchema(**current_neg_dict)
@@ -3790,8 +4780,8 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
             )
             raw_acc = list(recommended.get("accessories") or [])
             bundle_offer = recommended.get("bundle_offer")
-            product_currency = details.get("currency") or "PKR"
-            floor_for_margin = details.get("floor_price")
+            product_currency = details.get("currency") or currency
+            floor_for_margin = floor_override if floor_override is not None else details.get("floor_price")
             is_free_qual = qualifies_for_free_accessory(
                 float(price),
                 currency=product_currency,
@@ -3920,7 +4910,7 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
 
     margin_budget = free_gift_margin_budget(
         float(price),
-        details.get("floor_price"),
+        floor_override if floor_override is not None else details.get("floor_price"),
         bundle_offer,
     )
     accessory_rows = summarize_accessories_for_prompt(accessory_rows)
@@ -3928,14 +4918,14 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
     updated_neg_state, strategy = negotiation_engine.process_negotiation_round(
         current_state=current_neg_state,
         list_price=float(price),
-        floor_price_override=details.get("floor_price"),
+        floor_price_override=floor_override if floor_override is not None else details.get("floor_price"),
         customer_offered_price=customer_offer,
         product_type=product_category,
         product_name=details.get("name"),
         backend_promo_code=None,  # only set when discount/validate API exists
         accessories=accessory_rows,
         bundle_offer=bundle_offer,
-        currency=details.get("currency") or "PKR",
+        currency=details.get("currency") or currency,
         margin_budget=margin_budget,
         product_color=product_color,
         product_colors=product_available_colors,
@@ -4009,7 +4999,7 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
         "action": action,
         "offered_price": strategy.get("offered_price"),
         "original_price": float(price) if price else None,
-        "currency": details.get("currency") or "PKR",
+        "currency": details.get("currency") or currency,
         "discount_percent": strategy.get("discount_percent", 0.0),
         "bundles": updated_neg_state.offered_bundles,
         "accessories": accessories_for_display,
@@ -4045,6 +5035,15 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
     }
     if product_color:
         out["color"] = product_color
+    if quote_patch.get("price_quote") is not None:
+        out["price_quote"] = quote_patch["price_quote"]
+    if quote_patch.get("customize_pricing_mode") is not None:
+        out["customize_pricing_mode"] = quote_patch["customize_pricing_mode"]
+    if quote_patch.get("customer_profile"):
+        out["customer_profile"] = {
+            **dict(state.get("customer_profile") or {}),
+            **quote_patch["customer_profile"],
+        }
     return out
 
 
@@ -4272,48 +5271,87 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
     logger.info("generate_custom_design_node start %s", _log_state_summary(state))
     
     user_instructions = state.get("user_message", "")
+    prior_instructions = (state.get("custom_instructions") or "").strip()
+    wants_revision = _is_design_revision_request(user_instructions)
     base_product = None
     fabric_details = None
     
-    # Flow 2: In-Flow Customization (Customizing Selected Product)
+    # Fabric-first Path A: do NOT auto-attach a random catalogue product from the message
+    # (e.g. "Tuxedo" matching "Solid Matte Charcoal") — that steals the fabric reference.
     selected_product_id = state.get("selected_product_id")
-    if not selected_product_id or not base_product:
-        matched = _match_product_from_message(user_instructions, state.get("products") or [])
-        if not matched and state.get("messages"):
-            for msg in reversed(state.get("messages") or []):
-                meta = msg.get("metadata") or {}
-                if meta.get("products"):
-                    matched = _match_product_from_message(user_instructions, meta.get("products") or [])
-                    if matched:
-                        break
-        if not matched:
-            try:
-                cat_prods = await backend_api.search_products({"limit": 50})
-                matched = _match_product_from_message(user_instructions, cat_prods or [])
-            except Exception:
-                pass
-        if matched:
-            selected_product_id = matched.get("product_id") or matched.get("id")
-            base_product = matched
-        elif not selected_product_id and len(state.get("products") or []) == 1:
-            base_product = (state.get("products") or [])[0]
-            selected_product_id = base_product.get("product_id") or base_product.get("id")
+    fabric_first = bool(state.get("selected_fabric_catalog_code")) and not selected_product_id
 
-    if selected_product_id and not base_product:
+    if selected_product_id and not fabric_first:
         product_details = state.get("product_details") or {}
         if not product_details or str(product_details.get("product_id")) != str(selected_product_id):
             try:
                 product_details = await backend_api.get_product_details(selected_product_id)
             except Exception as e:
                 logger.error("Failed to get product details: %s", e)
-        base_product = product_details
+        base_product = product_details if isinstance(product_details, dict) else None
+    elif not fabric_first and not selected_product_id:
+        matched = _match_product_from_message(user_instructions, state.get("products") or [])
+        if matched:
+            selected_product_id = matched.get("product_id") or matched.get("id")
+            base_product = matched
+
+    # Resolve chosen fabric FIRST — never let a product image displace the swatch reference.
+    selected_fabric_code = state.get("selected_fabric_catalog_code")
+    if not selected_fabric_code:
+        matched_fabric = _match_fabric_from_message(
+            user_instructions, state.get("fabrics") or []
+        )
+        if matched_fabric:
+            selected_fabric_code = matched_fabric.get("catalog_code")
+
+    session_fabrics = [
+        f for f in (state.get("fabrics") or []) if isinstance(f, dict)
+    ]
+
+    def _fabric_from_session(code: str | None) -> dict[str, Any] | None:
+        if not code:
+            return None
+        for f in session_fabrics:
+            if str(f.get("catalog_code") or "") == str(code):
+                return dict(f)
+        return None
+
+    if selected_fabric_code:
+        try:
+            fabric_details = await backend_api.get_fabric_details(str(selected_fabric_code))
+        except Exception as e:
+            logger.error(
+                "Failed to get fabric details by selected_fabric_catalog_code=%s: %s",
+                selected_fabric_code,
+                e,
+            )
+            fabric_details = None
+        session_hit = _fabric_from_session(selected_fabric_code)
+        if session_hit:
+            if not fabric_details:
+                fabric_details = session_hit
+            else:
+                # Keep API fields but never drop a working swatch image from session.
+                if not fabric_details.get("image_url") and session_hit.get("image_url"):
+                    fabric_details["image_url"] = session_hit["image_url"]
+                if not fabric_details.get("name") and session_hit.get("name"):
+                    fabric_details["name"] = session_hit["name"]
+        logger.info(
+            "generate_custom_design_node selected fabric code=%s has_image=%s name=%s revision=%s",
+            selected_fabric_code,
+            bool((fabric_details or {}).get("image_url")),
+            (fabric_details or {}).get("name"),
+            wants_revision,
+        )
 
     # Defensive guardrail: Never generate image if user has not provided concrete customization specifications
-    if not _has_customization_details(
+    if not wants_revision and not _has_customization_details(
         user_instructions,
         selected_product_id,
-        state.get("selected_fabric_catalog_code"),
+        selected_fabric_code or state.get("selected_fabric_catalog_code"),
         base_product=base_product,
+    ) and not (
+        selected_fabric_code and (state.get("cut_style") or state.get("product_type"))
     ):
         logger.info(
             "generate_custom_design_node: skipping image generation because user has not provided concrete customization specifications."
@@ -4323,6 +5361,7 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
             "custom_design_result": None,
             "sales_stage": "customization",
             "custom_instructions": user_instructions,
+            "selected_fabric_catalog_code": selected_fabric_code,
         }
 
     # Check if a specific variation was selected or mentioned
@@ -4345,8 +5384,8 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
                     variation_piece = v
                     break
 
-    # Path B: when the selected product has fabric_id, load live fabric details.
-    if base_product and isinstance(base_product, dict):
+    # Path B: product fabric only when customer has NOT already chosen a fabric swatch.
+    if not fabric_details and base_product and isinstance(base_product, dict):
         fabric_id = (
             (variation_piece.get("fabric_id") if variation_piece else None)
             or base_product.get("fabric_id")
@@ -4363,35 +5402,17 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
             except Exception as e:
                 logger.error("Failed to get fabric details: %s", e)
 
-    # Reference image:
-    # If variation has its own image, use that as reference; otherwise base_product image
+    # Product image is silhouette reference only — never overwrite chosen fabric swatch.
     prod_img = None
     if variation_piece and (variation_piece.get("image_url") or variation_piece.get("images")):
-        prod_img = variation_piece.get("image_url") or (variation_piece.get("images")[0] if variation_piece.get("images") else None)
+        prod_img = variation_piece.get("image_url") or (
+            variation_piece.get("images")[0] if variation_piece.get("images") else None
+        )
     if not prod_img and base_product and isinstance(base_product, dict):
         prod_img = base_product.get("image_url")
         if not prod_img and isinstance(base_product.get("images"), list) and base_product.get("images"):
             prod_img = base_product["images"][0]
 
-    fabric_name = (
-        (fabric_details or {}).get("name")
-        or (variation_piece.get("fabric") if variation_piece else None)
-        or (base_product.get("fabric") if isinstance(base_product, dict) else None)
-        or (f"Signature fabric of {base_product.get('name', 'selected piece')}" if base_product else "Premium Royal Atelier Fabric")
-    )
-
-    if prod_img:
-        if not fabric_details:
-            fabric_details = {
-                "name": fabric_name,
-                "image_url": prod_img,
-            }
-        elif not fabric_details.get("image_url"):
-            fabric_details["image_url"] = prod_img
-            if not fabric_details.get("name"):
-                fabric_details["name"] = fabric_name
-
-    # Upfront fabric extraction: check for image URL in user message or state
     if not fabric_details:
         url_match = re.search(r'https?://[^\s<>"]+\b', user_instructions)
         if url_match:
@@ -4401,45 +5422,93 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
                 "name": "Custom Uploaded Fabric",
                 "image_url": extracted_url,
             }
-        elif state.get("selected_fabric_catalog_code"):
-            try:
-                fabric_details = await backend_api.get_fabric_details(state["selected_fabric_catalog_code"])
-            except Exception as e:
-                logger.error("Failed to get fabric details by selected_fabric_catalog_code: %s", e)
-    
+
     ceremony = state.get("event_type")
     colors = state.get("color")
-    dress_category = state.get("product_type") or (base_product.get("category") if base_product else None)
+    cut_style = state.get("cut_style")
+    dress_category = (
+        state.get("product_type")
+        or (base_product.get("category") if base_product else None)
+        or cut_style
+    )
     session_id = state.get("session_id")
     variation_name = (variation_piece.get("name") if variation_piece else None) or selected_pv_name
+
+    # Merge prior brief + new revision so fal gets full intent.
+    instruction_parts = [p for p in (prior_instructions, user_instructions) if p]
+    if cut_style and cut_style.lower() not in " ".join(instruction_parts).lower():
+        instruction_parts.append(f"Design preference / cut style: {cut_style}.")
+    if wants_revision:
+        instruction_parts.append(
+            "IMPORTANT REVISION: Apply the latest customer change to a NEW image. "
+            "Do not repeat the previous mockup."
+        )
+    merged_instructions = " ".join(instruction_parts).strip() or user_instructions
+
+    # Attach product image separately for silhouette when fabric swatch is already set.
+    base_for_gen = base_product
+    if isinstance(base_for_gen, dict) and prod_img and not base_for_gen.get("image_url"):
+        base_for_gen = {**base_for_gen, "image_url": prod_img}
     
     try:
         image_url, result_data = await generate_bespoke_design(
-            base_product=base_product,
+            base_product=base_for_gen,
             fabric_details=fabric_details,
-            user_instructions=user_instructions,
+            user_instructions=merged_instructions,
             ceremony=ceremony,
             colors=colors,
             dress_category=dress_category,
             session_id=session_id,
             variation_name=variation_name,
         )
-        return {
+        out: dict[str, Any] = {
             "custom_image_url": image_url,
             "custom_design_result": result_data,
             "sales_stage": "customization",
             "customization_stage": "measurements",
-            "custom_instructions": user_instructions,
+            "custom_instructions": merged_instructions,
+            "selected_fabric_catalog_code": selected_fabric_code,
             "product_details": None,
             "products": [],
         }
+        # Keep product_id for Path B pricing mode detection while clearing catalogue UI.
+        quote_state = {
+            **dict(state),
+            **out,
+            "selected_product_id": selected_product_id or state.get("selected_product_id"),
+            "product_type": dress_category or state.get("product_type"),
+            "fabrics": state.get("fabrics") or ([fabric_details] if fabric_details else []),
+        }
+        if isinstance(base_product, dict):
+            # Path B needs product fabric_id even after product_details cleared for UI
+            quote_state["product_details"] = {
+                "product_id": base_product.get("product_id") or selected_product_id,
+                "category": base_product.get("category"),
+                "fabric_id": base_product.get("fabric_id") or base_product.get("fabric_catalog_code"),
+                "fabric_catalog_code": base_product.get("fabric_catalog_code") or base_product.get("fabric_id"),
+                "name": base_product.get("name"),
+            }
+        if fabric_details and isinstance(fabric_details, dict):
+            quote_state["selected_fabric_catalog_code"] = (
+                selected_fabric_code
+                or fabric_details.get("catalog_code")
+                or fabric_details.get("fabric_id")
+            )
+            # Ensure grade available even if fabrics list empty
+            quote_state["fabrics"] = [fabric_details] + [
+                f for f in (state.get("fabrics") or []) if isinstance(f, dict)
+            ]
+        quote_patch = await _refresh_price_quote(quote_state)
+        out.update(quote_patch)
+        return out
     except Exception as e:
         logger.exception("generate_custom_design_node failed")
         return {
             "custom_image_url": None,
             "custom_design_result": {"error": str(e)},
             "sales_stage": "customization",
-            "custom_instructions": user_instructions,
+            "custom_instructions": merged_instructions,
+            "selected_fabric_catalog_code": selected_fabric_code,
             "product_details": None,
             "products": [],
         }
@@ -4459,6 +5528,20 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
             "final_response": preexisting,
             "messages": [{"role": "assistant", "content": preexisting}],
         }
+
+    # Keep calculator quote fresh for customize / price asks / checkout.
+    quote_patch: dict[str, Any] = {}
+    needs_quote = bool(
+        state.get("custom_image_url")
+        or state.get("custom_design_result")
+        or state.get("selected_fabric_catalog_code")
+        or state.get("customization_stage")
+    )
+    existing_quote = state.get("price_quote") if isinstance(state.get("price_quote"), dict) else {}
+    if needs_quote and not existing_quote.get("ok"):
+        quote_patch = await _refresh_price_quote(dict(state))
+        if quote_patch.get("price_quote"):
+            state = {**dict(state), **quote_patch}
 
     handover_result = state.get("handover_result") or {}
     contact = state.get("customer_contact") or {}
@@ -4539,7 +5622,7 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
                 "category": p.get("category"),
                 "available_sizes": p.get("available_sizes"),
                 "available_colors": p.get("available_colors"),
-                "product_url": p.get("product_url") if state.get("checkout_hand_off_note") else None,
+                "product_url": None,
             }
             for p in recommendations[:MAX_PRODUCTS_TO_SHOW]
             if isinstance(p, dict)
@@ -4549,13 +5632,21 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
                 "catalog_code": f.get("catalog_code"),
                 "name": f.get("name"),
                 "fabric_type": f.get("fabric_type"),
+                "fabric_grade": f.get("fabric_grade") or f.get("grade"),
                 "season": f.get("season"),
+                "seasons": f.get("seasons") or [],
                 "available_colors": f.get("available_colors"),
                 "embroidery": f.get("embroidery"),
                 "description": f.get("description"),
+                "image_url": f.get("image_url"),
             }
-            for f in (state.get("fabrics") or [])[:MAX_PRODUCTS_TO_SHOW]
+            for f in (state.get("fabrics") or [])
             if isinstance(f, dict)
+            and (
+                not state.get("selected_fabric_catalog_code")
+                or str(f.get("catalog_code")) == str(state.get("selected_fabric_catalog_code"))
+                or state.get("customization_stage") in (None, "fabric_selection", "preferences")
+            )
         ],
         "cross_sell_items": [
             {
@@ -4626,32 +5717,30 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
         "catalog_search_note": catalog_search_note,
         "available_colors_summary": state.get("available_colors_summary") or [],
         "checkout_hand_off_note": state.get("checkout_hand_off_note"),
+        "checkout_url": state.get("checkout_url"),
         "product_interest_note": state.get("product_interest_note"),
         "product_variation_note": state.get("product_variation_note"),
-        "selected_product_url": (
-            (state.get("product_details") or {}).get("product_url")
-            if isinstance(state.get("product_details"), dict)
-            and (state.get("checkout_hand_off_note") or state.get("buying_intent") == "ready_to_buy")
-            else None
-        )
-        or (
-            next(
-                (
-                    str(p.get("product_url"))
-                    for p in recommendations
-                    if isinstance(p, dict)
-                    and str(p.get("product_id")) == str(state.get("selected_product_id") or "")
-                    and p.get("product_url")
-                ),
-                None,
-            )
-            if state.get("checkout_hand_off_note")
-            else None
-        ),
+        "selected_product_url": state.get("checkout_url"),
+        "price_quote": public_price_quote(state.get("price_quote") if isinstance(state.get("price_quote"), dict) else None),
+        "customize_pricing_mode": state.get("customize_pricing_mode"),
     }
 
     sales_stage = state.get("sales_stage") or "discovery"
     system_prompt_content = SYSTEM_PROMPT
+
+    # Hard pricing instruction when calculator quote is ready (beats consultant fallback).
+    pub_quote = context.get("price_quote") if isinstance(context.get("price_quote"), dict) else None
+    if pub_quote and pub_quote.get("list_price") is not None:
+        currency = pub_quote.get("currency") or "GBP"
+        list_price = pub_quote.get("list_price")
+        unit = pub_quote.get("unit_price")
+        system_prompt_content += f"""
+[CRITICAL — CALCULATOR PRICE READY]
+context.price_quote has list_price={list_price} {currency} (unit_price={unit}).
+- If the customer asks price / qeemat / kitna / cost / pricing: you MUST quote this exact list_price in {currency}.
+- Do NOT say a Style Consultant will quote. Do NOT invent a different number.
+- Do NOT re-describe the image at length — answer the price clearly in 1–2 sentences, then invite checkout or feedback.
+"""
 
     if sales_stage == "discovery":
         profile_dict = dict(state.get("customer_profile") or {})
@@ -4663,11 +5752,29 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
             event_type=state.get("event_type") or profile.event_type,
             category_variations=state.get("category_variations") or [],
         )
-    elif sales_stage == "negotiation" or state.get("negotiation_result") or state.get("intent") == "discount_request":
+    elif (
+        sales_stage == "negotiation"
+        or state.get("negotiation_result")
+        or state.get("intent") == "discount_request"
+        or _negotiation_awaiting_color(state)
+    ):
         system_prompt_content += NEGOTIATION_PLAYBOOK
     elif sales_stage == "objection" or state.get("objection_type"):
         system_prompt_content += OBJECTION_PLAYBOOK
         system_prompt_content += f"\n- Active objection_type: {state.get('objection_type')}.\n"
+    elif state.get("checkout_hand_off_note") or state.get("checkout_url") or (
+        state.get("close_result") and (state.get("sales_stage") == "closing" or state.get("buying_intent") == "ready_to_buy")
+    ):
+        # Checkout hand-off wins over customization/bespoke playbooks — never ask size/naap.
+        system_prompt_content += CLOSING_PLAYBOOK
+        system_prompt_content += """
+[CRITICAL — CHECKOUT READY]
+checkout_url / checkout_hand_off_note is present. Confirm their approval in 1–2 short sentences
+and guide them to secure checkout NOW. Do NOT ask standard size or body measurements.
+Size and naap are collected on the checkout page. Do NOT invent a cart URL.
+"""
+        if context.get("cross_sell_items"):
+            system_prompt_content += CROSS_SELL_PLAYBOOK
     elif (
         sales_stage == "customization"
         or state.get("custom_design_result")
@@ -4687,29 +5794,87 @@ The bespoke visual design concept has ALREADY been generated successfully and is
 - Strictly NEVER write "Image:" or markdown image links in your text reply. The bespoke visual card is rendered exclusively by the frontend.
 - You MUST directly, proudly, and enthusiastically present this newly created bespoke design to the customer right now.
 - Do NOT ask "kya aap customize karwana chahenge" or ask if they want to customize it — IT IS ALREADY CREATED!
-- Describe the bespoke piece: explain how their requested modifications (e.g. navy blue velvet, tuxedo styling, lapels, custom fabric) look in this design.
-- State clearly that our master tailors craft this bespoke piece within 3-4 weeks.
-- Invite their feedback on the visual concept ("Does this match your vision? / Kya yeh aapke vision ke mutabiq hai?") or offer to proceed to measurement booking.
+- Describe the bespoke piece briefly.
+- Invite their feedback ("Does this match your vision? / Kya yeh aapke vision ke mutabiq hai?").
+- Do NOT ask for standard size or body measurements in chat — those are on the checkout page.
+- When they say pasand / perfect / I like this: hand them to checkout — never collect size/naap here.
 """
+        elif state.get("customization_stage") == "cut_style" or (
+            state.get("selected_fabric_catalog_code") and not state.get("cut_style")
+        ):
+            selected_code = state.get("selected_fabric_catalog_code")
+            selected_name = None
+            for f in context.get("fabrics") or []:
+                if str(f.get("catalog_code")) == str(selected_code):
+                    selected_name = f.get("name")
+                    break
+            label = selected_name or selected_code or "selected fabric"
+            system_prompt_content += f"""
+[CRITICAL INSTRUCTION: FABRIC CHOSEN — ASK DESIGN PREFERENCE ONLY]
+Customer already chose fabric: {label} (catalog {selected_code}).
+- Reply in 1–2 short sentences matching their language.
+- Confirm the fabric choice briefly, then ask ONLY what design/cut they want
+  (Sherwani, Angrakha, Bandhgala, Achkan, Prince Coat, Tuxedo / 3-piece, embroidery light or heavy).
+- Do NOT list fabric colour variants, other fabrics, catalog codes, or invent cloth names.
+- Do NOT generate or claim an image yet.
+"""
+            if catalog_search_note:
+                system_prompt_content += f"\n[STAGE NOTE]\n{catalog_search_note}\n"
         else:
             system_prompt_content += """
 [CRITICAL INSTRUCTION: GATHER MISSING CUSTOMIZATION DETAILS]
 The customer wants a customized piece, but specific customization details (such as desired color, fabric type, or cut) have not been specified yet.
 - Enthusiastically confirm that bespoke customization is fully possible.
-- Ask them which specific color, fabric (e.g. velvet, raw silk, worsted wool), or styling details they have in mind so we can generate their custom visual mockup.
+- Ask them which specific color or styling details they have in mind — only from live context, never invent fabric names.
 """
+            if catalog_search_note:
+                system_prompt_content += f"\n[STAGE NOTE]\n{catalog_search_note}\n"
     elif sales_stage == "styling" or state.get("intent") == "style_advice":
         system_prompt_content += STYLING_PLAYBOOK
     elif state.get("cross_sell_items") or "suggest_cross_sell" in (state.get("required_steps") or []):
         system_prompt_content += CROSS_SELL_PLAYBOOK
-    elif state.get("checkout_hand_off_note") or state.get("product_variation_note") or state.get("product_interest_note") or (
+    elif state.get("product_interest_note") and not state.get("checkout_hand_off_note"):
+        system_prompt_content += (
+            "\n[PLAYBOOK: SELECTED PIECE CONFIRM]\n"
+            f"{state.get('product_interest_note')}\n"
+            "Do NOT say 'Yeh hain hamare options' / 'Here are our pieces'. "
+            "Do NOT re-list catalog products. Speak as if the piece is already chosen and move the sale forward.\n"
+        )
+        if state.get("sales_stage") == "closing":
+            system_prompt_content += (
+                "Invite checkout next. Share checkout_url ONLY if checkout_hand_off_note is present. "
+                "Do NOT ask for body measurements in chat.\n"
+            )
+    elif (
+        state.get("intent") == "fabric_custom"
+        or "search_fabrics" in (state.get("executed_nodes") or [])
+        or "search_fabrics" in (state.get("required_steps") or [])
+        or context.get("fabrics") is not None
+        and state.get("customization_stage") == "fabric_selection"
+    ):
+        system_prompt_content += CUSTOM_FABRIC_PLAYBOOK
+        fabric_rows = context.get("fabrics") or []
+        if not fabric_rows:
+            system_prompt_content += (
+                "\n[CRITICAL — NO FABRIC SWATCHES FOR THIS GARMENT/EVENT]\n"
+                f"{catalog_search_note or 'No matching fabrics in catalogue for this category.'}\n"
+                "Reply in the customer's language. Do NOT say 'Yeh hain hamare fabrics'. "
+                "Do NOT invent or list Suit/Super-120 cloths for Nikah/Sherwani. "
+                "Offer ready-made Sherwani browse or a Style Consultant for bespoke cloth sourcing.\n"
+            )
+        else:
+            system_prompt_content += (
+                "\n[CRITICAL — FABRIC CARDS ALREADY RENDERED]\n"
+                f"fabrics has {len(fabric_rows)} row(s). Reply with ONE short intro only.\n"
+            )
+    elif state.get("checkout_hand_off_note") or state.get("product_variation_note") or (
         context["recommendations"]
         or state.get("product_details")
         or state.get("catalog_search_note")
         or state.get("sales_stage") == "recommendation"
     ):
         system_prompt_content += RECOMMENDATION_PLAYBOOK
-        if recommendations:
+        if recommendations and not state.get("product_interest_note"):
             cat = str(
                 (recommendations[0] or {}).get("category")
                 or state.get("product_type")
@@ -4790,12 +5955,20 @@ The customer wants a customized piece, but specific customization details (such 
         "product_details": state.get("product_details"),
     }
     sanitized_reply = guardrails.sanitize_agent_output(response.content, guard_context)
+    sanitized_reply = _force_checkout_handoff_reply(
+        sanitized_reply,
+        user_message=state.get("user_message") or "",
+        checkout_url=state.get("checkout_url"),
+    )
     # Hard cap: product cards must never be preceded by long LLM stories.
     if recommendations and not (
         state.get("checkout_hand_off_note")
         or state.get("negotiation_result")
+        or state.get("product_interest_note")
         or state.get("custom_image_url")
         or state.get("custom_design_result")
+        or _negotiation_awaiting_color(state)
+        or _in_active_negotiation(state)
     ):
         sanitized_reply = _force_short_product_reply(
             sanitized_reply,
@@ -4859,5 +6032,8 @@ The customer wants a customized piece, but specific customization details (such 
         "messages": [{"role": "assistant", "content": sanitized_reply}],
         "customer_contact": contact,
         "handover_pending": handover_pending,
+        "price_quote": state.get("price_quote"),
+        "customize_pricing_mode": state.get("customize_pricing_mode"),
+        "customer_profile": state.get("customer_profile"),
     }
 

@@ -3,30 +3,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import uuid
-from datetime import date, time as time_type
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
-from urllib.parse import urlparse
 
 import httpx
-from dotenv import load_dotenv
-from fastapi import APIRouter, HTTPException, Request
-from openai import OpenAI
-from pydantic import BaseModel, Field, HttpUrl
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 from app.config import settings
-from app.core.logging_config import log_openai_call, safe_len
+from app.core.logging_config import safe_len
+from app.services.backend_api import backend_api
 from app.services.image_store import image_store
-from app.services.styling_rules import (
-    TIME_BASED_COLORS,
-    SEASONAL_RECOMMENDATIONS,
-    get_time_period,
-    get_season,
-    body_type_recommendation,
-    skin_tone_recommendation,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -43,130 +31,84 @@ GENERATED_DIR = STATIC_DIR / "generated"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_openai_client() -> OpenAI:
-    """OpenRouter OpenAI-compatible client."""
-    if not OPENROUTER_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENROUTER_API_KEY (or OPENAI_API_KEY) environment variable is missing.",
-        )
-    return OpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        default_headers={
-            "HTTP-Referer": settings.OPENROUTER_HTTP_REFERER,
-            "X-Title": settings.OPENROUTER_APP_TITLE,
-        },
-    )
-
-
 class WeddingImageRequest(BaseModel):
+    """Slim generate body: prompt + category + system fabric (or optional swatch URL)."""
 
+    prompt: str = Field(..., min_length=1, description="Free-text design brief for the outfit image")
+    dress_category: Optional[str] = Field(
+        default=None,
+        description="Garment category e.g. Sherwani, Suits (alias: category)",
+        examples=["Sherwani"],
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="Alias for dress_category",
+        examples=["Sherwani"],
+    )
+    fabric_catalog_code: Optional[str] = Field(
+        default=None,
+        description="Fabric catalog_code from GET /api/generate-wedding-image/fabrics?category=...",
+    )
+    fabric_image_url: Optional[HttpUrl] = Field(
+        default=None,
+        description="Optional direct fabric swatch URL override (if not using catalog_code)",
+    )
     session_id: Optional[str] = None
     user_id: Optional[str] = None
-    
-    # fabric_image_url is the URL of the fabric image to be used for the wedding image
-    fabric_image_url: Optional[HttpUrl] = None
-    
-    # religion and ceremony are the religion and ceremony of the wedding
-    religion: str
-    ceremony: str
-    
-    # wedding_date and wedding_time are the date and time of the wedding
-    wedding_date: date
-    wedding_time: time_type
-    location: str
-    # venue_type is the type of the venue
-    venue_type: str
-
-    # dress_category is the category of the dress
-    dress_category: str
-    # styles, colors, embroidery, patterns are the styles, colors, embroidery, and patterns of the dress
-    styles: List[str] = Field(default_factory=list)
-    # colors are the colors of the dress
-    colors: List[str] = Field(default_factory=list)
-    # embroidery are the embroidery of the dress
-    embroidery: List[str] = Field(default_factory=list)
-    # patterns are the patterns of the dress
-    patterns: List[str] = Field(default_factory=list)
-    # fit is the fit of the dress
-    fit: str
-
-    # body_type is the body type of the groom
-    body_type: str
-    # skin_tone is the skin tone of the groom
-    skin_tone: str
-
-    # budget is the budget of the groom
-    budget: str
-    # delivery_timeline is the delivery timeline of the groom
-    delivery_timeline: str
-
-    # accessories are the accessories of the groom
-    accessories: List[str] = Field(default_factory=list)
-    # footwear is the footwear of the groom
-    footwear: str
-
-    # wedding_theme is the theme of the wedding
-    wedding_theme: str
-    # personal_preferences are the personal preferences of the groom
-    personal_preferences: List[str] = Field(default_factory=list)
-
-    # match_bride is a boolean indicating if the groom should match the bride
-    match_bride: bool = False
-    # bride_color is the color of the bride
-    bride_color: Optional[str] = None
-    # bride_fabric is the fabric of the bride
-    bride_fabric: Optional[str] = None
-    # bride_embroidery is the embroidery of the bride
-    bride_embroidery: Optional[str] = None
-    # bride_jewelry_tone is the jewelry tone of the bride
-    bride_jewelry_tone: Optional[str] = None
-
-    # size is the size of the image
-    size: str = "1024x1536"
-    # quality is the quality of the image
-    quality: Literal["low", "medium", "high", "auto"] = "medium"
-    # output_format is the format of the image
     output_format: Literal["png", "jpeg", "webp"] = "png"
+
+    # --- legacy fields (kept for reference — not accepted on this slim API) ---
+    # religion: str
+    # ceremony: str
+    # wedding_date: date
+    # wedding_time: time_type
+    # location: str
+    # venue_type: str
+    # styles: List[str] = Field(default_factory=list)
+    # colors: List[str] = Field(default_factory=list)
+    # embroidery: List[str] = Field(default_factory=list)
+    # patterns: List[str] = Field(default_factory=list)
+    # fit: str
+    # body_type: str
+    # skin_tone: str
+    # budget: str
+    # delivery_timeline: str
+    # accessories: List[str] = Field(default_factory=list)
+    # footwear: str
+    # wedding_theme: str
+    # personal_preferences: List[str] = Field(default_factory=list)
+    # match_bride: bool = False
+    # bride_color: Optional[str] = None
+    # bride_fabric: Optional[str] = None
+    # bride_embroidery: Optional[str] = None
+    # bride_jewelry_tone: Optional[str] = None
+    # size: str = "1024x1536"
+    # quality: Literal["low", "medium", "high", "auto"] = "medium"
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "fabric_image_url": "https://your-domain.com/uploads/fabric.png",
-                    "religion": "Muslim",
-                    "ceremony": "Walima",
-                    "wedding_date": "2026-12-25",
-                    "wedding_time": "19:30:00",
-                    "location": "London, UK",
-                    "venue_type": "Hotel Ballroom",
+                    "prompt": "Ivory sherwani with light gold zardozi on collar, clean bandhgala cut, matching shirt and formal shoes, maroon mannequin, minimal studio background",
                     "dress_category": "Sherwani",
-                    "styles": ["Royal", "Luxury"],
-                    "colors": ["Ivory", "Gold"],
-                    "embroidery": ["Hand Embroidery", "Antique Gold"],
-                    "patterns": ["Mughal", "Paisley"],
-                    "fit": "Tailored",
-                    "body_type": "Athletic",
-                    "skin_tone": "Wheatish",
-                    "budget": "£500-1000",
-                    "delivery_timeline": "One Month",
-                    "accessories": ["Brooch", "Pocket Square", "Khussa"],
-                    "footwear": "Khussa",
-                    "wedding_theme": "Royal Palace",
-                    "personal_preferences": ["Prefer Lightweight", "Breathable"],
-                    "match_bride": True,
-                    "bride_color": "Ivory",
-                    "bride_fabric": "Silk",
-                    "bride_embroidery": "Gold Zari",
-                    "bride_jewelry_tone": "Gold",
-                    "size": "1024x1536",
-                    "quality": "medium",
-                    "output_format": "png"
+                    "fabric_catalog_code": "FAB-001",
+                    "output_format": "png",
                 }
             ]
         }
     }
+
+    @model_validator(mode="after")
+    def _require_category_and_fabric(self) -> "WeddingImageRequest":
+        resolved_category = (self.dress_category or self.category or "").strip()
+        if not resolved_category:
+            raise ValueError("dress_category (or category) is required.")
+        self.dress_category = resolved_category
+        if not self.fabric_catalog_code and not self.fabric_image_url:
+            raise ValueError(
+                "Provide fabric_catalog_code (from fabrics-by-category) or fabric_image_url."
+            )
+        return self
 
 
 class ImageMetadata(BaseModel):
@@ -186,6 +128,24 @@ class WeddingImageResponse(BaseModel):
     fabric_analysis: Dict[str, Any]
     image_record_id: int
     metadata: ImageMetadata
+    fabric_catalog_code: Optional[str] = None
+    dress_category: Optional[str] = None
+
+
+class FabricListItem(BaseModel):
+    catalog_code: str
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+    dress_category: Optional[Any] = None
+    color: Optional[str] = None
+    fabric_type: Optional[str] = None
+
+
+class FabricListResponse(BaseModel):
+    category: str
+    count: int
+    fabrics: List[FabricListItem]
+    note: Optional[str] = None
 
 
 def clean_json_text(text: str) -> str:
@@ -249,19 +209,9 @@ async def image_url_to_data_url(image_url: str) -> str:
 
 async def analyze_fabric_image(fabric_image_url: str) -> Dict[str, Any]:
     logger.info("Fabric analysis start")
-    client = get_openai_client()
-    data_url = await image_url_to_data_url(fabric_image_url)
+    from app.services.ai.fal import FalProvider
 
-    with log_openai_call(logger, operation="fabric_analysis", model=FABRIC_ANALYSIS_MODEL):
-        response = client.responses.create(
-            model=FABRIC_ANALYSIS_MODEL,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": """
+    prompt = """
 Analyze this fabric image for luxury wedding menswear.
 
 Return ONLY valid JSON in this exact structure:
@@ -282,22 +232,17 @@ Rules:
 - Keep it short.
 - Focus on fabric, color, embroidery, pattern and texture.
 - Do not add markdown.
-""",
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": data_url,
-                        },
-                    ],
-                }
-            ],
-        )
-
-    raw_text = clean_json_text(response.output_text)
-
+""".strip()
+    raw_text = ""
     try:
-        analysis = json.loads(raw_text)
+        raw_text = await FalProvider().analyze_image(
+            prompt,
+            [fabric_image_url],
+            system_prompt="Return ONLY valid JSON. No markdown.",
+        )
+        analysis = json.loads(clean_json_text(raw_text))
     except Exception:
+        logger.exception("Fabric analysis via fal vision failed — using defaults")
         analysis = {
             "fabric_type_guess": "Unknown",
             "dominant_colors": [],
@@ -341,20 +286,16 @@ Rules:
 
 async def generate_image_metadata(prompt: str, dress_category: str = "", ceremony: str = "") -> ImageMetadata:
     logger.info("Image metadata generation start prompt_length=%s", safe_len(prompt))
-    client = get_openai_client()
+    from app.services.llm import acall_llm
+
     try:
-        with log_openai_call(logger, operation="image_metadata", model=FABRIC_ANALYSIS_MODEL):
-            response = client.chat.completions.create(
-                model=FABRIC_ANALYSIS_MODEL,
-                messages=[
-                    {"role": "system", "content": _METADATA_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=600,
-            )
-        raw_text = clean_json_text(response.choices[0].message.content or "")
-        data = json.loads(raw_text)
+        raw_text = await acall_llm(
+            _METADATA_SYSTEM_PROMPT,
+            prompt,
+            json_mode=True,
+            max_tokens=600,
+        )
+        data = json.loads(clean_json_text(raw_text))
         metadata = ImageMetadata(
             title=data.get("title") or f"{dress_category} for {ceremony}".strip(" for"),
             short_description=data.get("short_description") or "",
@@ -379,111 +320,67 @@ async def generate_image_metadata(prompt: str, dress_category: str = "", ceremon
         )
 
 
-def build_wedding_prompt(data: WeddingImageRequest, fabric_analysis: Dict[str, Any]) -> str:
-    time_period = get_time_period(data.wedding_time)
-    season = get_season(data.wedding_date)
+def build_wedding_prompt(
+    data: WeddingImageRequest,
+    fabric_analysis: Dict[str, Any],
+    *,
+    fabric_name: str | None = None,
+    has_fabric_image: bool = False,
+) -> str:
+    """Compose fal prompt from user free-text + category + fabric analysis."""
+    category = (data.dress_category or data.category or "Wedding menswear").strip()
+    user_brief = (data.prompt or "").strip()
 
-    time_colors = TIME_BASED_COLORS[time_period]
-    seasonal = SEASONAL_RECOMMENDATIONS[season]
-
-    bride_context = ""
-    if data.match_bride:
-        bride_context = f"""
-Bride matching guidance:
-- Bride dress color: {data.bride_color or "Not provided"}
-- Bride fabric: {data.bride_fabric or "Not provided"}
-- Bride embroidery: {data.bride_embroidery or "Not provided"}
-- Bride jewelry tone: {data.bride_jewelry_tone or "Not provided"}
-- Groom outfit should complement the bride, not exactly copy her look.
-"""
-
-    if data.fabric_image_url:
+    if has_fabric_image:
         fabric_section = f"""
-Uploaded fabric reference analysis:
+Fabric reference analysis:
+- Catalog fabric name: {fabric_name or "Catalogue swatch"}
 - Fabric type guess: {fabric_analysis.get("fabric_type_guess", "")}
-- Dominant colors: {", ".join(fabric_analysis.get("dominant_colors", []))}
-- Secondary colors: {", ".join(fabric_analysis.get("secondary_colors", []))}
+- Dominant colors: {", ".join(fabric_analysis.get("dominant_colors", []) or [])}
+- Secondary colors: {", ".join(fabric_analysis.get("secondary_colors", []) or [])}
 - Pattern: {fabric_analysis.get("pattern", "")}
 - Embroidery style: {fabric_analysis.get("embroidery_style", "")}
 - Texture: {fabric_analysis.get("texture", "")}
 - Visual weight: {fabric_analysis.get("visual_weight", "")}
 - Luxury level: {fabric_analysis.get("luxury_level", "")}
 - Style notes: {fabric_analysis.get("style_notes", "")}
-- Recommended use: {fabric_analysis.get("recommended_use", "")}
 """
         design_instruction = """
 Important design instruction:
-Use the uploaded fabric image as the main design reference.
-The final groom outfit should clearly reflect the same fabric feel, color family, embroidery language, texture, pattern mood, and luxury level from the uploaded fabric.
+Use the fabric swatch image as the main material reference.
+The outfit must clearly reflect the same fabric colour, weave, texture, pattern mood, and embroidery language.
 """
     else:
         fabric_section = """
 Fabric reference:
-- No fabric image was uploaded.
-- Design the outfit using the user-selected colors, styles, embroidery, patterns, dress category, and seasonal recommendations below.
+- No fabric swatch image was available.
+- Follow the user's prompt and dress category only.
 """
         design_instruction = """
 Important design instruction:
-No fabric image was provided. Create the groom outfit based on the user-selected dress category, colors, styles, embroidery, patterns, fit, and seasonal recommendations.
+Create the outfit from the user prompt and dress category. Do not invent a named catalogue fabric.
 """
 
-    prompt = f"""
-Create a high-end realistic fashion editorial image of a groom wearing a luxury wedding outfit.
+    return f"""
+Create a high-end realistic fashion product photograph of a Turabees bespoke wedding outfit.
 
-Wedding context:
-- Religion / tradition: {data.religion}
-- Ceremony: {data.ceremony}
-- Wedding date: {data.wedding_date.strftime("%d %B %Y")}
-- Wedding time: {data.wedding_time.strftime("%I:%M %p")}
-- Time period: {time_period}
-- Location: {data.location}
-- Venue type: {data.venue_type}
-- Wedding theme: {data.wedding_theme}
+User design brief (follow closely):
+{user_brief}
 
-Outfit design:
-- Dress category: {data.dress_category}
-- Style: {", ".join(data.styles)}
-- User selected colors: {", ".join(data.colors)}
-- Recommended time-based colors: {", ".join(time_colors)}
-- Season: {season}
-- Seasonal recommended colors: {", ".join(seasonal["colors"])}
-- Seasonal recommended fabrics: {", ".join(seasonal["fabrics"])}
-- User selected embroidery preferences: {", ".join(data.embroidery)}
-- User selected pattern preferences: {", ".join(data.patterns)}
-- Fit: {data.fit}
+Outfit context:
+- Dress category: {category}
 {fabric_section}
-AI personalization:
-- Body type: {data.body_type}
-- Body type styling recommendation: {body_type_recommendation(data.body_type)}
-- Skin tone: {data.skin_tone}
-- Complexion-friendly color recommendation: {skin_tone_recommendation(data.skin_tone)}
-- Budget range: {data.budget}
-- Delivery timeline: {data.delivery_timeline}
-- Personal preferences: {", ".join(data.personal_preferences)}
-
-Accessories:
-- Accessories: {", ".join(data.accessories)}
-- Footwear: {data.footwear}
-
-{bride_context}
 {design_instruction}
 
 Image requirements:
-- Full-body groom outfit.
-- Premium catalog photography.
-- Realistic luxury wedding fashion.
-- Elegant confident pose.
-- Clean background inspired by selected venue.
-- Realistic fabric texture, embroidery, collar, buttons, cuffs, footwear, and accessories.
-- No text.
-- No watermark.
-- No logo.
-- No extra people.
-- No distorted hands.
+- Display the outfit on a maroon / deep burgundy dressmaker mannequin (NOT a human model).
+- Minimal clean photography studio background — soft neutral seamless backdrop, even studio lighting.
+- Full-length mannequin view from form to shoes — complete styled look, never cropped above the ankles.
+- COMPLETE STYLING (mandatory): matching dress shirt under the jacket/sherwani; polished formal shoes (Oxfords/brogues/loafers) clearly visible — NEVER bare mannequin feet; for suits/tuxedos also a coordinated tie or bow tie and pocket square when the cut allows; trousers break cleanly over the shoes.
+- Sharp photorealistic tailoring and fabric drape.
+- No text, no watermark, no logos, no extra people.
 - Commercially presentable for an online bespoke wedding menswear platform.
 """.strip()
-
-    return prompt
 
 
 def generate_image_bytes(
@@ -492,35 +389,26 @@ def generate_image_bytes(
     quality: str,
     output_format: str,
 ) -> bytes:
-    client = get_openai_client()
+    from app.services.fal_image import generate_image_bytes_fal
 
-    logger.info("Image generation start size=%s output_format=%s prompt_length=%s", size, output_format, safe_len(prompt))
-    with log_openai_call(logger, operation="image_generation", model=IMAGE_MODEL):
-        result = client.images.generate(
-            model=IMAGE_MODEL,
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            output_format=output_format,
-            n=1,
-        )
-
-    image_base64 = result.data[0].b64_json
-    image_bytes = base64.b64decode(image_base64)
+    logger.info(
+        "Image generation start via fal size=%s output_format=%s prompt_length=%s",
+        size,
+        output_format,
+        safe_len(prompt),
+    )
+    image_bytes = generate_image_bytes_fal(prompt)
     logger.info("Image generation end output_size_bytes=%s", len(image_bytes))
     return image_bytes
 
 
 def save_generated_image(image_bytes: bytes, output_format: str) -> str:
     file_id = str(uuid.uuid4())
-
     ext = "jpg" if output_format == "jpeg" else output_format
     filename = f"{file_id}.{ext}"
     file_path = GENERATED_DIR / filename
-
     with open(file_path, "wb") as f:
         f.write(image_bytes)
-
     return filename
 
 
@@ -529,46 +417,116 @@ def build_public_image_url(request: Request, filename: str) -> str:
     return f"{base_url}/static/generated/{filename}"
 
 
+def _slim_fabric_row(row: dict[str, Any]) -> FabricListItem | None:
+    code = str(row.get("catalog_code") or row.get("fabric_id") or "").strip()
+    if not code:
+        return None
+    return FabricListItem(
+        catalog_code=code,
+        name=row.get("name"),
+        image_url=row.get("image_url") or row.get("imageUrl"),
+        dress_category=row.get("dress_category") or row.get("category"),
+        color=row.get("color") or row.get("dominant_color"),
+        fabric_type=row.get("fabric_type") or row.get("type"),
+    )
+
+
+@router.get("/api/generate-wedding-image/fabrics", response_model=FabricListResponse)
+async def list_wedding_image_fabrics(
+    category: str = Query(..., min_length=1, description="Dress category e.g. Sherwani, Suits"),
+):
+    """Return live catalogue fabrics for the chosen category (no inventing / no Suit dump)."""
+    cat = category.strip()
+    logger.info("wedding_image fabrics list start category=%s", cat)
+    try:
+        rows = await backend_api.search_fabrics(
+            {"category": cat, "dress_category": cat, "limit": 100}
+        )
+    except Exception as exc:
+        logger.exception("wedding_image fabrics list failed category=%s", cat)
+        raise HTTPException(status_code=502, detail=f"Fabric catalogue unavailable: {exc}") from exc
+
+    fabrics: list[FabricListItem] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            item = _slim_fabric_row(row)
+            if item:
+                fabrics.append(item)
+
+    note = None
+    if not fabrics:
+        note = (
+            f"No fabric swatches found in catalogue for category '{cat}'. "
+            "Do not substitute another category's fabrics."
+        )
+    logger.info("wedding_image fabrics list end category=%s count=%s", cat, len(fabrics))
+    return FabricListResponse(category=cat, count=len(fabrics), fabrics=fabrics, note=note)
+
+
+async def _resolve_fabric_swatch(
+    payload: WeddingImageRequest,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Return (swatch_url, fabric_name, fabric_row_or_empty)."""
+    if payload.fabric_image_url:
+        return str(payload.fabric_image_url), None, {}
+
+    code = (payload.fabric_catalog_code or "").strip()
+    if not code:
+        return None, None, {}
+
+    fabric = await backend_api.get_fabric_details(code)
+    if not fabric or fabric.get("error"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Fabric not found for catalog_code={code!r}.",
+        )
+    image_url = fabric.get("image_url") or fabric.get("imageUrl")
+    if not image_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fabric {code} has no image_url in catalogue.",
+        )
+    return str(image_url), fabric.get("name"), fabric
+
+
 @router.post("/api/generate-wedding-image", response_model=WeddingImageResponse)
 async def generate_wedding_image(payload: WeddingImageRequest, request: Request):
     try:
+        category = (payload.dress_category or payload.category or "").strip()
         logger.info(
-            "Wedding image request start ceremony=%s dress_category=%s size=%s "
-            "output_format=%s fabric_image_present=%s",
-            payload.ceremony,
-            payload.dress_category,
-            payload.size,
-            payload.output_format,
+            "Wedding image request start category=%s fabric_code=%s "
+            "fabric_url_override=%s output_format=%s",
+            category,
+            payload.fabric_catalog_code,
             payload.fabric_image_url is not None,
+            payload.output_format,
         )
 
-        if not payload.styles:
-            raise HTTPException(status_code=400, detail="styles is required.")
+        swatch_url, fabric_name, _fabric_row = await _resolve_fabric_swatch(payload)
 
-        if not payload.colors:
-            raise HTTPException(status_code=400, detail="colors is required.")
-
-        if not payload.embroidery:
-            raise HTTPException(status_code=400, detail="embroidery is required.")
-
-        if not payload.patterns:
-            raise HTTPException(status_code=400, detail="patterns is required.")
-
-        if payload.fabric_image_url:
-            fabric_analysis = await analyze_fabric_image(str(payload.fabric_image_url))
+        if swatch_url:
+            fabric_analysis = await analyze_fabric_image(swatch_url)
         else:
-            logger.info("Fabric analysis skipped no fabric image provided")
+            logger.info("Fabric analysis skipped no fabric image")
             fabric_analysis = default_fabric_analysis()
 
-        prompt = build_wedding_prompt(payload, fabric_analysis)
+        prompt = build_wedding_prompt(
+            payload,
+            fabric_analysis,
+            fabric_name=fabric_name,
+            has_fabric_image=bool(swatch_url),
+        )
         logger.info("Wedding prompt built prompt_length=%s", safe_len(prompt))
 
-        image_bytes = generate_image_bytes(
-            prompt=prompt,
-            size=payload.size,
-            quality=payload.quality,
-            output_format=payload.output_format,
-        )
+        from app.services.fal_image import generate_image_bytes_fal
+
+        fabric_urls = [swatch_url] if swatch_url else []
+        if fabric_urls:
+            prompt += (
+                "\n\nFigure 1 is the fabric swatch from our catalogue. Apply this exact fabric "
+                "colour, weave, texture, and embroidery onto the full-length outfit. No text."
+            )
+        image_bytes = generate_image_bytes_fal(prompt, image_urls=fabric_urls)
 
         filename = save_generated_image(
             image_bytes=image_bytes,
@@ -581,8 +539,8 @@ async def generate_wedding_image(payload: WeddingImageRequest, request: Request)
 
         image_metadata = await generate_image_metadata(
             prompt=prompt,
-            dress_category=payload.dress_category,
-            ceremony=payload.ceremony,
+            dress_category=category,
+            ceremony=category,
         )
 
         image_record_id = await image_store.save_generated_image_record(
@@ -595,7 +553,11 @@ async def generate_wedding_image(payload: WeddingImageRequest, request: Request)
             preferences=payload.model_dump(mode="json"),
             metadata=image_metadata.model_dump(),
         )
-        logger.info("Wedding image request complete record_id=%s metadata_title=%s", image_record_id, image_metadata.title)
+        logger.info(
+            "Wedding image request complete record_id=%s metadata_title=%s",
+            image_record_id,
+            image_metadata.title,
+        )
 
         return WeddingImageResponse(
             success=True,
@@ -604,6 +566,8 @@ async def generate_wedding_image(payload: WeddingImageRequest, request: Request)
             fabric_analysis=fabric_analysis,
             image_record_id=image_record_id,
             metadata=image_metadata,
+            fabric_catalog_code=payload.fabric_catalog_code,
+            dress_category=category,
         )
 
     except HTTPException:

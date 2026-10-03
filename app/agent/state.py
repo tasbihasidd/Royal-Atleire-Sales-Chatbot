@@ -87,8 +87,11 @@ class SalesAgentState(TypedDict):
     catalog_search_note: NotRequired[str | None]
     available_colors_summary: NotRequired[list[str]]
     checkout_hand_off_note: NotRequired[str | None]
+    checkout_url: NotRequired[str | None]
+    checkout_session_id: NotRequired[str | None]
     wants_more_options: NotRequired[bool | None]
     product_interest_note: NotRequired[str | None]
+    suppress_product_ui: NotRequired[bool]
     catalog_variations: NotRequired[list[dict[str, Any]]]
     category_variations: NotRequired[list[dict[str, Any]]]
     selected_variation_id: NotRequired[str | None]
@@ -104,6 +107,9 @@ class SalesAgentState(TypedDict):
     custom_instructions: NotRequired[str | None]
     customization_stage: NotRequired[str | None]  # preferences | fabric_selection | cut_style | generation | measurements
     cut_style: NotRequired[str | None]
+    # Pricing (Turabees calculator / catalogue)
+    price_quote: NotRequired[dict[str, Any] | None]
+    customize_pricing_mode: NotRequired[str | None]  # direct | product | null
 
     # Seen products tracking across turns
     shown_product_ids: NotRequired[list[str]]

@@ -78,6 +78,42 @@ def derive_season_from_text(wedding_date: str | None) -> str | None:
     return None
 
 
+# Live catalogue season labels (fabrics + products search APIs).
+_CATALOG_SEASON_BY_KEY = {
+    "summer": "Spring / Summer",
+    "spring": "Spring / Summer",
+    "winter": "Autumn / Winter",
+    "autumn": "Autumn / Winter",
+    "fall": "Autumn / Winter",
+    "all-season": "All Season",
+    "all season": "All Season",
+    "allseason": "All Season",
+}
+
+
+def map_season_for_catalog_api(season: str | None) -> str | None:
+    """
+    Map agent season words (summer/winter/…) to catalogue API labels
+    (e.g. 'Spring / Summer'). Pass through values that already look like API labels.
+    """
+    if not season:
+        return None
+    raw = str(season).strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+    if lower in _CATALOG_SEASON_BY_KEY:
+        return _CATALOG_SEASON_BY_KEY[lower]
+    # Already an API-style label
+    if "/" in raw or lower == "all season":
+        # Normalize casing of known labels
+        for label in _CATALOG_SEASON_BY_KEY.values():
+            if label.lower() == lower:
+                return label
+        return raw
+    return _CATALOG_SEASON_BY_KEY.get(lower) or raw
+
+
 def body_type_recommendation(body_type: str) -> str:
     rules = {
         "Slim": "structured shoulders, slightly layered silhouette, medium embroidery, richer fabric",

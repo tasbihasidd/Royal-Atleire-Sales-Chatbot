@@ -7,6 +7,7 @@ import pytest
 
 from app.services.ai.deepseek import DEEPSEEK_DEFAULT_MODEL, DeepSeekProvider
 from app.services.ai.factory import AIProviderFactory
+from app.services.ai.fal import FalProvider
 from app.services.ai.openrouter import (
     FIREWORKS_DEFAULT_MODEL,
     OPENROUTER_DEFAULT_MODEL,
@@ -16,6 +17,14 @@ from app.services.llm import build_chat_model, call_llm, strip_think_tags
 
 
 FIREWORKS_MODEL = "accounts/fireworks/models/deepseek-v3p1"
+
+
+def test_factory_fal():
+    with patch("app.services.ai.factory.settings") as s:
+        s.LLM_PROVIDER = "fal"
+        provider = AIProviderFactory.make()
+    assert isinstance(provider, FalProvider)
+    assert provider.model_name
 
 
 def test_factory_openrouter():
