@@ -1,8 +1,0 @@
-1.sb sa phala endpoint banaga jo redis ka sb session clear karaga
-
-2.fastapi ma ak endpoint honga jaha sa pori testing hongi wahi pa session clear ka option aye ga aur waha pa hum kisi session ma switch kar sakta ha basically html ki ui hogi 
-
-3.chat ki ui ma option ya bi honga ka kn  si nodes call hoe is chat ka liya
-
-
-4. mainay ek product ki variations pouchi usnay category ko dekh k vairtaions suggest krdi 

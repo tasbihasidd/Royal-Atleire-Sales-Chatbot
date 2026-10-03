@@ -8,22 +8,39 @@ This version includes:
 - PostgreSQL session/chat persistence
 - Dockerfile and docker-compose.yml
 
-## Services
+## Ports
 
-```text
-api       → FastAPI chatbot on http://localhost:8015
-postgres  → PostgreSQL exposed on localhost:5434
-```
+| Mode | API | Postgres |
+|------|-----|----------|
+| **Local** (uvicorn on host) | `http://localhost:8015` | `localhost:22006` (docker postgres) |
+| **Live / Docker** (`docker compose`) | `http://localhost:2006` | container DNS `postgres:5432` |
 
-## Start
+`.env` is for local host runs. `docker-compose.yml` overrides `PORT`, `BASE_URL`, and `DATABASE_URL` for the API container.
+
+## Local (recommended for development)
 
 ```bash
 cp .env.example .env
-# Add OPENROUTER_API_KEY in .env
-docker compose up --build
+# set FAL_KEY / BACKEND_API_TOKEN as needed
+
+# Postgres only (or full stack — API on 2006 won't block host :8015)
+docker compose up -d postgres
+
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8015 --reload
 ```
 
-## Test chat
+```bash
+curl -fsS http://localhost:8015/health
+```
+
+## Live / Docker (port 2006)
+
+```bash
+docker compose up --build -d
+curl -fsS http://localhost:2006/health
+```
+
+## Test chat (local)
 
 ```bash
 curl -X POST http://localhost:8015/chat \
