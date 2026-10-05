@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+
+from sqlalchemy import func, select
 
 from app.services.db import AsyncSessionLocal, GeneratedWeddingImage
 
@@ -47,8 +50,36 @@ class ImageStore:
             )
             return record.id
 
+    async def count_images_between(
+        self,
+        session_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Count custom/wedding image records for session in [start, end)."""
+        if not session_id:
+            return 0
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(func.count())
+                    .select_from(GeneratedWeddingImage)
+                    .where(
+                        GeneratedWeddingImage.session_id == session_id,
+                        GeneratedWeddingImage.created_at >= start,
+                        GeneratedWeddingImage.created_at < end,
+                    )
+                )
+                return int(result.scalar_one() or 0)
+        except Exception as e:
+            logger.warning(
+                "count_images_between failed session_id=%s: %s",
+                session_id,
+                e,
+            )
+            return 0
+
     async def list_recent_records(self, limit: int = 20) -> list[dict]:
-        from sqlalchemy import select
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(GeneratedWeddingImage)

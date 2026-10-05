@@ -8,10 +8,13 @@ from app.routes.image_generation import (
     generate_image_metadata,
 )
 from app.services.fal_image import generate_image_bytes_fal
+from app.services.garment_silhouette import garment_silhouette_guidance
 from app.services.image_store import image_store
+from app.services.quota_service import require_quota
 from fastapi import Request
 
 logger = logging.getLogger(__name__)
+
 
 async def generate_bespoke_design(
     base_product: Dict[str, Any] | None,
@@ -27,7 +30,21 @@ async def generate_bespoke_design(
     Generates a bespoke design image for a given product/fabric and user instructions.
     """
     logger.info("generate_bespoke_design start session_id=%s variation=%s", session_id, variation_name)
-    
+
+    if session_id:
+        decision = await require_quota(session_id, "custom_image")
+        if not decision.allowed:
+            logger.info(
+                "generate_bespoke_design quota exceeded session_id=%s used=%s",
+                session_id,
+                decision.used,
+            )
+            return None, {
+                "error": "quota_exceeded",
+                "quota": decision.to_dict(),
+                "message": decision.message,
+            }
+
     # 1. Analyze Fabric / Reference Image
     ref_image_url = None
     if fabric_details and fabric_details.get("image_url"):
@@ -109,13 +126,13 @@ Base Design Blueprint & Signature Style:
 {var_cut_line}- Design Heritage: {base_desc}
 - Original Craftsmanship: {base_fabric} with {base_embroidery}
 
-CRITICAL FIDELITY & CUSTOMIZATION DIRECTIVE:
+        CRITICAL FIDELITY & CUSTOMIZATION DIRECTIVE:
 You are customizing the Turabees signature piece "{base_product_name}".
-1. PRESERVE THE IDENTITY: Retain the signature regal silhouette, structured shoulder cut, neckline, and opulent embroidery density of "{base_product_name}" UNLESS the customer explicitly asks for minimal / no embroidery / simpler look.
+1. PRESERVE THE IDENTITY: Retain the signature regal silhouette, structured shoulder cut, neckline, and embroidery density of "{base_product_name}" UNLESS the customer explicitly asks for minimal / no embroidery / simpler look.
 2. APPLY CUSTOM MODIFICATIONS ACCORDING TO USER INSTRUCTIONS:
 >> Customer Request: {user_instructions} <<
 3. The outfit MUST be made from the customer's chosen fabric swatch (see fabric reference). Match that cloth's colour and texture exactly.
-4. If the customer asks for minimal / no embroidery: remove heavy gold/zardozi work — keep a clean, elegant tuxedo/suit look.
+4. If the customer asks for minimal / no embroidery: reduce heavy gold/zardozi — keep clean surfaces. Do NOT change the garment category into a western overcoat with lapels to "simplify" it.
 """
     else:
         design_blueprint = f"""
@@ -126,10 +143,12 @@ Bespoke Atelier Creation (fabric-first):
 
 CRITICAL:
 1. Build the outfit FROM the fabric reference image (colour, weave, sheen, texture).
-2. Follow the cut/style in the user request (e.g. Tuxedo, Sherwani).
-3. If they ask for minimal / no embroidery: keep clean lapels and no heavy gold floral work.
+2. Follow the cut/style named in the user request exactly (Prince Coat ≠ Sherwani ≠ Suit ≠ winter overcoat).
+3. If they ask for minimal / no embroidery: keep clean, tonal surfaces — do NOT invent western lapels or overcoat length unless that cut was requested.
 4. Do NOT invent a different fabric colour or a random catalogue piece title.
 """
+
+    cut_lock = garment_silhouette_guidance(dress_category, user_instructions)
 
     fabric_section = f"""
 Fabric & Material Specifications:
@@ -148,6 +167,8 @@ Context & Vision:
 
 {design_blueprint}
 
+{cut_lock}
+
 {fabric_section}
 
 Image Aesthetics & Presentation Requirements:
@@ -156,12 +177,11 @@ Image Aesthetics & Presentation Requirements:
 - The scene must clearly read as a professional fashion studio shoot — no palace, courtyard, outdoor landscape, or busy scenery.
 - Full-length mannequin view from head of form to shoes — complete styled look, never cropped above the ankles.
 - COMPLETE STYLING (mandatory — not optional):
-  • Matching dress shirt that complements the outfit colour and formality (e.g. crisp white, ivory, or tonal shirt for suits; elegant collar shirt under sherwani/bandhgala).
-  • Matching formal footwear clearly visible — polished leather Oxfords, brogues, or loafers that suit the outfit; NEVER bare mannequin feet or bare ankles.
-  • For suits / tuxedos: include a coordinated tie or bow tie and a tasteful pocket square when the cut allows.
-  • For sherwani / indo-western: include appropriate formal shoes and a clean shirt collar visible at the neckline; optional stole only if it fits the brief.
-  • Trousers must sit properly over shoes with a clean break — no floating hems, no bare feet on a metal plate.
-- Tactile ultra-detailed fabric drape, 3D threadwork where requested; if minimal/no embroidery is asked, keep clean surfaces.
+  • Inner layer must match the brief: if shalwar kameez is requested, use plain white shalwar kameez — not a western dress shirt + tie unless the cut is Suit/Tuxedo.
+  • For Prince Coat / Sherwani / Bandhgala: Mandarin or closed band collar on the outer garment; polished formal leather shoes; trousers or shalwar sitting cleanly over shoes.
+  • For suits / tuxedos only: dress shirt, coordinated tie or bow tie, and pocket square when the cut allows.
+  • NEVER bare mannequin feet or bare ankles; NEVER an open winter overcoat silhouette when Prince Coat or Sherwani was requested.
+- Tactile ultra-detailed fabric drape; embroidery only as requested (minimal means sparse/tonal, not dense allover grid robes).
 - Sharp photorealistic tailoring, natural fabric folds, and flawless proportions.
 - No text, no watermark, no captions, no logos.
 """

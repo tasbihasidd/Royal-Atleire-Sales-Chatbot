@@ -1168,6 +1168,35 @@ class BackendAPIClient:
             raw=result if isinstance(result, dict) else {},
         )
 
+    async def get_chatbot_quotas(self, session_id: str | None = None) -> dict[str, Any]:
+        """
+        GET /chatbot/quotas — daily limits from Royal Attire (when live).
+
+        Expected: { success, data: { limits: { no_of_ai_messages_perday, no_of_custom_images_perday } } }
+        """
+        params: dict[str, Any] = {}
+        if session_id:
+            params["session_id"] = session_id
+        logger.info("Backend API get_chatbot_quotas start session_id=%s", session_id)
+        kwargs: dict[str, Any] = {}
+        if params:
+            kwargs["params"] = params
+        result = await self._request("GET", "/chatbot/quotas", **kwargs)
+        data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else result
+        if not isinstance(data, dict):
+            data = {}
+        limits = data.get("limits") if isinstance(data.get("limits"), dict) else data
+        out = {
+            "success": bool(result.get("success", True)) if isinstance(result, dict) else True,
+            "timezone": data.get("timezone") or "Asia/Karachi",
+            "limits": {
+                "no_of_ai_messages_perday": limits.get("no_of_ai_messages_perday"),
+                "no_of_custom_images_perday": limits.get("no_of_custom_images_perday"),
+            },
+        }
+        logger.info("Backend API get_chatbot_quotas end limits=%s", out["limits"])
+        return out
+
     async def create_checkout_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /checkout → { data: { checkout_url, session_id, ... } }."""
         items = payload.get("items") or []

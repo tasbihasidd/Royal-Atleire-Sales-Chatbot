@@ -1892,10 +1892,18 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
     ):
         steps.append("check_inventory")
         intent = "inventory_check" if intent == "general" else "mixed"
-    if any(w in text for w in ["discount", "kam karo", "kam hojayega", "negotiate", "offer", "discount mil sakta"]):
-        if session.get("selected_product_id"):
+    if any(w in text for w in [
+        "discount", "kam karo", "kam hojayega", "kam ho", "thori kam", "thora kam",
+        "price kam", "qeemat kam", "negotiate", "offer", "discount mil sakta",
+    ]):
+        if (
+            session.get("selected_product_id")
+            or session.get("custom_image_url")
+            or (isinstance(session.get("price_quote"), dict) and session.get("price_quote", {}).get("ok"))
+        ):
             steps.append("calculate_negotiation_offer")
             intent = "discount_request" if intent == "general" else "mixed"
+            steps = [s for s in steps if s != "search_fabrics"]
     # Colour reply after we asked colour during negotiation → continue the ladder, do not search.
     if (
         session.get("selected_product_id")
@@ -2370,13 +2378,27 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         # CRITICAL: Clear products list when entering negotiation — focus on selected product only
         session_products = []
 
-    # Price push with a selected product must always run the negotiation ladder.
+    # Price push with a selected product OR an active bespoke/custom quote must run the negotiation ladder.
     _discount_cues = (
         "discount", "negotiate", "expensive", "mehngi", "mehnga",
-        "thora zyada", "zyada hai", "kam karo", "offer",
+        "thora zyada", "zyada hai", "kam karo", "kam ho", "thori kam", "thora kam",
+        "price kam", "qeemat kam", "offer",
+    )
+    _has_negotiable_piece = bool(
+        state.get("selected_product_id")
+        or plan.get("selected_product_id")
+        or state.get("custom_image_url")
+        or (
+            isinstance(state.get("price_quote"), dict)
+            and state.get("price_quote", {}).get("ok")
+        )
+        or (
+            isinstance(state.get("custom_design_result"), dict)
+            and state.get("custom_design_result", {}).get("image_url")
+        )
     )
     if (
-        (state.get("selected_product_id") or plan.get("selected_product_id"))
+        _has_negotiable_piece
         and any(cue in user_message.lower() for cue in _discount_cues)
         and "calculate_negotiation_offer" not in required_steps
         and "create_human_handover" not in required_steps
@@ -2386,6 +2408,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         sales_stage = "negotiation"
         # CRITICAL: Clear products list — negotiation conversations should focus on selected product only, no carousel
         session_products = []
+        # Don't browse fabrics during a price push on an existing design.
+        required_steps = [s for s in required_steps if s != "search_fabrics"]
 
     # After we asked for a colour to match an accessory, a colour reply continues negotiation.
     named_color_now = _extract_explicit_color(user_message)
@@ -2409,9 +2433,22 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             if s not in ("search_products", "search_accessories", "generate_custom_design")
         ]
 
-    # CRITICAL GUARD: Negotiation / discount is ONLY valid when a product is actually selected!
-    # If no product is selected yet, price-conscious phrases ("normal batao", "zada expensive nhi", "sasta") are budget guidance for search.
-    if not (state.get("selected_product_id") or plan.get("selected_product_id")):
+    # CRITICAL GUARD: Negotiation / discount needs a negotiable piece (catalog OR bespoke quote).
+    # If none yet, price-conscious phrases are budget guidance for search — strip negotiation.
+    _has_negotiable_piece = bool(
+        state.get("selected_product_id")
+        or plan.get("selected_product_id")
+        or state.get("custom_image_url")
+        or (
+            isinstance(state.get("price_quote"), dict)
+            and state.get("price_quote", {}).get("ok")
+        )
+        or (
+            isinstance(state.get("custom_design_result"), dict)
+            and state.get("custom_design_result", {}).get("image_url")
+        )
+    )
+    if not _has_negotiable_piece:
         if intent == "discount_request":
             intent = "product_search" if (state.get("event_type") or plan.get("event_type")) else "general"
         if sales_stage == "negotiation":
@@ -5431,6 +5468,25 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
         or (base_product.get("category") if base_product else None)
         or cut_style
     )
+    # Keep Prince Coat / Bandhgala cut from being lost when product_type is still Sherwani/etc.
+    from app.services.garment_silhouette import infer_garment_cut
+
+    cut_key = infer_garment_cut(
+        dress_category,
+        " ".join(
+            p
+            for p in (
+                state.get("custom_instructions"),
+                state.get("user_message"),
+                cut_style,
+            )
+            if p
+        ),
+    )
+    if cut_key == "prince_coat":
+        dress_category = "Prince Coat"
+    elif cut_key == "sherwani" and not dress_category:
+        dress_category = "Sherwani"
     session_id = state.get("session_id")
     variation_name = (variation_piece.get("name") if variation_piece else None) or selected_pv_name
 
@@ -5461,6 +5517,18 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
             session_id=session_id,
             variation_name=variation_name,
         )
+        if isinstance(result_data, dict) and result_data.get("error") == "quota_exceeded":
+            return {
+                "custom_image_url": None,
+                "custom_design_result": result_data,
+                "final_response": result_data.get("message")
+                or "Aaj ki custom design image limit poori ho chuki hai. Kal try karein.",
+                "sales_stage": "customization",
+                "custom_instructions": merged_instructions,
+                "selected_fabric_catalog_code": selected_fabric_code,
+                "product_details": None,
+                "products": [],
+            }
         out: dict[str, Any] = {
             "custom_image_url": image_url,
             "custom_design_result": result_data,
@@ -5740,6 +5808,28 @@ context.price_quote has list_price={list_price} {currency} (unit_price={unit}).
 - If the customer asks price / qeemat / kitna / cost / pricing: you MUST quote this exact list_price in {currency}.
 - Do NOT say a Style Consultant will quote. Do NOT invent a different number.
 - Do NOT re-describe the image at length — answer the price clearly in 1–2 sentences, then invite checkout or feedback.
+"""
+
+    neg_pub = context.get("negotiation_result") if isinstance(context.get("negotiation_result"), dict) else None
+    neg_acc = (neg_pub or {}).get("accessories") if isinstance(neg_pub, dict) else None
+    acc_list = context.get("accessories") if isinstance(context.get("accessories"), list) else []
+    has_named_gift = bool(
+        (isinstance(neg_acc, list) and any(
+            (isinstance(a, str) and a.strip()) or (isinstance(a, dict) and (a.get("name") or a.get("title")))
+            for a in neg_acc
+        ))
+        or any(
+            (isinstance(a, dict) and (a.get("name") or a.get("title")))
+            for a in acc_list
+        )
+    )
+    if not has_named_gift:
+        system_prompt_content += """
+[CRITICAL — NO INVENTED ACCESSORIES]
+negotiation_result.accessories / accessories lists are empty or missing.
+- Do NOT offer or name pocket square, stole, khussa, cufflinks, tie, turban, or any complimentary gift.
+- If the customer asks for discount: hold list price; say no complimentary accessory is confirmed in stock for this piece right now; offer Style Consultant if needed.
+- NEVER invent a gift SKU.
 """
 
     if sales_stage == "discovery":

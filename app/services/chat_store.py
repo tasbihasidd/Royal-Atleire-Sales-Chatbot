@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, delete, func
@@ -365,7 +366,7 @@ class ChatStore:
                 {
                     "role": role,
                     "content": content,
-                    "created_at": None,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                     "metadata": metadata or {},
                 }
             )
@@ -402,6 +403,50 @@ class ChatStore:
             logger.warning("get_messages DB failed session_id=%s — memory: %s", session_id, e)
             msgs = list(_MEM_MESSAGES.get(session_id) or [])
             return msgs[-limit:]
+
+    async def count_user_messages_between(
+        self,
+        session_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Count role=user messages in [start, end) for daily quota (Option A)."""
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(func.count())
+                    .select_from(ChatMessage)
+                    .where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at >= start,
+                        ChatMessage.created_at < end,
+                    )
+                )
+                return int(result.scalar_one() or 0)
+        except Exception as e:
+            logger.warning(
+                "count_user_messages_between DB failed session_id=%s — memory: %s",
+                session_id,
+                e,
+            )
+            count = 0
+            for msg in _MEM_MESSAGES.get(session_id) or []:
+                if msg.get("role") != "user":
+                    continue
+                raw = msg.get("created_at")
+                if not raw:
+                    count += 1
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if start <= ts < end:
+                        count += 1
+                except ValueError:
+                    count += 1
+            return count
 
     async def clear_session(self, session_id: str) -> None:
         """Delete all chat messages and chat session record for session_id."""

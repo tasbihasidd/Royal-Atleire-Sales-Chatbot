@@ -1,8 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+logger = logging.getLogger(__name__)
 
 # Provider selection — fal.ai is the Royal Atelier default.
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "fal").strip().lower()
@@ -48,6 +51,58 @@ PKR_PER_GBP = float(_pkr_per_gbp) if _pkr_per_gbp else None
 DEFAULT_MARKET_CURRENCY = (os.getenv("DEFAULT_MARKET_CURRENCY") or "PKR").strip().upper()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# LangSmith (opt-in). Also accept LANGCHAIN_TRACING_V2 as alias.
+LANGSMITH_TRACING = _env_bool("LANGSMITH_TRACING") or _env_bool("LANGCHAIN_TRACING_V2")
+LANGSMITH_API_KEY = (os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY") or "").strip()
+LANGSMITH_PROJECT = (
+    os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT") or "royal-atelier-sales-agent"
+).strip()
+LANGSMITH_ENDPOINT = (os.getenv("LANGSMITH_ENDPOINT") or os.getenv("LANGCHAIN_ENDPOINT") or "").strip()
+LANGCHAIN_HIDE_INPUTS = _env_bool("LANGCHAIN_HIDE_INPUTS")
+LANGCHAIN_HIDE_OUTPUTS = _env_bool("LANGCHAIN_HIDE_OUTPUTS")
+INCLUDE_COST_IN_RESPONSE = _env_bool("INCLUDE_COST_IN_RESPONSE")
+
+# Fallback USD only when Fal Platform pricing/billing APIs are unreachable.
+# Primary cost source: GET api.fal.ai/v1/models/pricing + billing-events per request_id.
+LLM_COST_INPUT_PER_1M_USD = _env_float("LLM_COST_INPUT_PER_1M_USD", 0.15)
+LLM_COST_OUTPUT_PER_1M_USD = _env_float("LLM_COST_OUTPUT_PER_1M_USD", 0.60)
+FAL_IMAGE_COST_USD = _env_float("FAL_IMAGE_COST_USD", 0.04)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# Chatbot daily quotas (Option A). Limits hardcoded until Royal Attire GET is live.
+CHATBOT_QUOTA_ENFORCE = _env_bool("CHATBOT_QUOTA_ENFORCE", True)
+CHATBOT_QUOTA_USE_BACKEND = _env_bool("CHATBOT_QUOTA_USE_BACKEND", False)
+CHATBOT_AI_MESSAGES_PER_DAY = _env_int("CHATBOT_AI_MESSAGES_PER_DAY", 10)
+CHATBOT_CUSTOM_IMAGES_PER_DAY = _env_int("CHATBOT_CUSTOM_IMAGES_PER_DAY", 2)
+
+
 class Settings(BaseSettings):
     LLM_PROVIDER: str = LLM_PROVIDER or "fal"
     LLM_MODEL: str = LLM_MODEL or ""
@@ -86,7 +141,63 @@ class Settings(BaseSettings):
     PKR_PER_GBP: float | None = PKR_PER_GBP
     DEFAULT_MARKET_CURRENCY: str = DEFAULT_MARKET_CURRENCY
 
+    LANGSMITH_TRACING: bool = LANGSMITH_TRACING
+    LANGSMITH_API_KEY: str = LANGSMITH_API_KEY
+    LANGSMITH_PROJECT: str = LANGSMITH_PROJECT
+    LANGSMITH_ENDPOINT: str = LANGSMITH_ENDPOINT
+    LANGCHAIN_HIDE_INPUTS: bool = LANGCHAIN_HIDE_INPUTS
+    LANGCHAIN_HIDE_OUTPUTS: bool = LANGCHAIN_HIDE_OUTPUTS
+    INCLUDE_COST_IN_RESPONSE: bool = INCLUDE_COST_IN_RESPONSE
+
+    LLM_COST_INPUT_PER_1M_USD: float = LLM_COST_INPUT_PER_1M_USD
+    LLM_COST_OUTPUT_PER_1M_USD: float = LLM_COST_OUTPUT_PER_1M_USD
+    FAL_IMAGE_COST_USD: float = FAL_IMAGE_COST_USD
+
+    CHATBOT_QUOTA_ENFORCE: bool = CHATBOT_QUOTA_ENFORCE
+    CHATBOT_QUOTA_USE_BACKEND: bool = CHATBOT_QUOTA_USE_BACKEND
+    CHATBOT_AI_MESSAGES_PER_DAY: int = CHATBOT_AI_MESSAGES_PER_DAY
+    CHATBOT_CUSTOM_IMAGES_PER_DAY: int = CHATBOT_CUSTOM_IMAGES_PER_DAY
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
+
+
+def configure_langsmith() -> bool:
+    """
+    Sync LangSmith / LangChain tracing env vars before any graph/LLM run.
+    Returns True when tracing is enabled.
+    """
+    enabled = bool(settings.LANGSMITH_TRACING)
+    if enabled:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGSMITH_TRACING"] = "true"
+        if settings.LANGSMITH_API_KEY:
+            os.environ["LANGSMITH_API_KEY"] = settings.LANGSMITH_API_KEY
+            os.environ["LANGCHAIN_API_KEY"] = settings.LANGSMITH_API_KEY
+        if settings.LANGSMITH_PROJECT:
+            os.environ["LANGSMITH_PROJECT"] = settings.LANGSMITH_PROJECT
+            os.environ["LANGCHAIN_PROJECT"] = settings.LANGSMITH_PROJECT
+        if settings.LANGSMITH_ENDPOINT:
+            os.environ["LANGSMITH_ENDPOINT"] = settings.LANGSMITH_ENDPOINT
+            os.environ["LANGCHAIN_ENDPOINT"] = settings.LANGSMITH_ENDPOINT
+        os.environ["LANGCHAIN_HIDE_INPUTS"] = "true" if settings.LANGCHAIN_HIDE_INPUTS else "false"
+        os.environ["LANGCHAIN_HIDE_OUTPUTS"] = "true" if settings.LANGCHAIN_HIDE_OUTPUTS else "false"
+        if not settings.LANGSMITH_API_KEY:
+            logger.warning(
+                "LangSmith tracing enabled but LANGSMITH_API_KEY is empty — runs will not upload"
+            )
+        else:
+            logger.info(
+                "LangSmith tracing enabled project=%s",
+                settings.LANGSMITH_PROJECT,
+            )
+    else:
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+        os.environ["LANGSMITH_TRACING"] = "false"
+        logger.info("LangSmith tracing disabled")
+    return enabled
+
+
+configure_langsmith()

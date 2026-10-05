@@ -6,6 +6,7 @@ This version includes:
 - LangGraph sales-agent flow
 - LangChain tools (products, fabrics, inventory, negotiation, handover)
 - PostgreSQL session/chat persistence
+- LangSmith observability + per-session AI cost estimates
 - Dockerfile and docker-compose.yml
 
 ## Ports
@@ -40,6 +41,33 @@ docker compose up --build -d
 curl -fsS http://localhost:2006/health
 ```
 
+`docker-compose` loads `.env` via `env_file`, so `LANGSMITH_*` and cost rate vars are passed through automatically.
+
+## LangSmith + per-user cost
+
+1. Create a project at [smith.langchain.com](https://smith.langchain.com) and copy an API key.
+2. In `.env`:
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=royal-atelier-sales-agent
+```
+
+3. Chat with a stable `session_id`, then in LangSmith filter runs by metadata `session_id` to see that user’s graph + LLM spans and costs.
+4. Local quick totals (in-memory for this process):
+
+```bash
+curl "http://localhost:8015/sessions/s1/cost"
+```
+
+Optional:
+
+- `INCLUDE_COST_IN_RESPONSE=true` — attach `state.cost` on `/chat`
+- `LANGCHAIN_HIDE_INPUTS=true` / `LANGCHAIN_HIDE_OUTPUTS=true` — redact bodies in prod
+- Per-call cost comes from Fal Platform APIs (`/v1/models/pricing`, `/v1/models/billing-events`) using `FAL_KEY`
+- `LLM_COST_*` / `FAL_IMAGE_COST_USD` — offline fallbacks only
+
 ## Test chat (local)
 
 ```bash
@@ -55,6 +83,23 @@ Response includes `reply`, `imageurl` (absolute product image when search return
 ```bash
 curl "http://localhost:8015/sessions/s1/messages"
 ```
+
+## Chatbot daily quotas
+
+Limits (messages / custom images per day) are **hardcoded in env** until Royal Attire ships `GET /chatbot/quotas`. Usage is counted from **today’s** chat + image history (`Asia/Karachi`). Virtual try-on is **not** under this quota.
+
+```bash
+CHATBOT_QUOTA_ENFORCE=true
+CHATBOT_QUOTA_USE_BACKEND=false   # set true when RA GET is live
+CHATBOT_AI_MESSAGES_PER_DAY=10
+CHATBOT_CUSTOM_IMAGES_PER_DAY=2
+```
+
+```bash
+curl "http://localhost:8015/sessions/s1/quota"
+```
+
+When backend is ready: set `CHATBOT_QUOTA_USE_BACKEND=true` — chatbot calls `GET …/sales-agent/chatbot/quotas` for limits; counting stays local.
 
 ## Where real-time backend APIs connect
 

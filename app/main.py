@@ -15,7 +15,9 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.agent.graph import sales_agent_graph
+from app.config import settings
 from app.core.logging_config import (
+    get_request_id,
     reset_request_id,
     safe_len,
     sanitize_query_params,
@@ -25,6 +27,12 @@ from app.core.logging_config import (
 from app.routes.image_generation import router as image_generation_router
 from app.routes.virtual_tryon import router as virtual_tryon_router
 from app.services.chat_store import chat_store
+from app.services.cost_tracking import (
+    clear_session_cost,
+    get_session_cost,
+    session_cost_scope,
+)
+from app.services.quota_service import get_quota_status, require_quota
 from app.services.memory_service import memory_service
 from app.schemas.profile import CustomerProfileSchema
 from app.schemas.negotiation import NegotiationStateSchema
@@ -227,6 +235,27 @@ async def chat(request: ChatRequest):
             safe_len(request.message),
         )
 
+        quota = await require_quota(request.session_id, "ai_message")
+        if not quota.allowed:
+            logger.info(
+                "Chat quota exceeded session_id=%s used=%s limits=%s",
+                request.session_id,
+                quota.used,
+                quota.limits,
+            )
+            soft = quota.message or (
+                "Aaj ki AI chat limit poori ho chuki hai. Kal phir try karein."
+            )
+            return ChatResponse(
+                reply=soft,
+                imageurl="",
+                executed_nodes=[],
+                state={
+                    "quota_exceeded": True,
+                    "quota": quota.to_dict(),
+                },
+            )
+
         await chat_store.ensure_session(request.session_id)
         await chat_store.add_message(
             session_id=request.session_id,
@@ -316,9 +345,21 @@ async def chat(request: ChatRequest):
         }
 
 
-        config = {}
+        config = {
+            "configurable": {"thread_id": request.session_id},
+            "metadata": {
+                "session_id": request.session_id,
+                "request_id": get_request_id(),
+            },
+            "tags": [
+                "royal-atelier",
+                "sales-agent",
+                str(settings.LLM_PROVIDER or "fal"),
+            ],
+        }
         logger.info("LangGraph invoke start session_id=%s", request.session_id)
-        result = await sales_agent_graph.ainvoke(initial_state, config=config)
+        with session_cost_scope(request.session_id):
+            result = await sales_agent_graph.ainvoke(initial_state, config=config)
         executed_nodes = list(result.get("executed_nodes") or [])
         logger.info(
             "LangGraph invoke end session_id=%s intent=%s required_steps=%s "
@@ -447,53 +488,56 @@ async def chat(request: ChatRequest):
             or result.get("sales_stage") == "customization"
             or suppress_ui
         )
+        state_payload = {
+            "intent": result.get("intent"),
+            "sales_stage": result.get("sales_stage"),
+            "discovery_next_slot": result.get("discovery_next_slot"),
+            "required_steps": result.get("required_steps"),
+            "executed_nodes": executed_nodes,
+            "buying_intent": result.get("buying_intent"),
+            "selected_product_id": result.get("selected_product_id"),
+            "products": [] if hide_catalog else result.get("products", []),
+            "product_details": None if hide_catalog else result.get("product_details"),
+            "suppress_product_ui": hide_catalog,
+            "checkout_hand_off_note": result.get("checkout_hand_off_note"),
+            "checkout_url": result.get("checkout_url") or session_context.get("checkout_url"),
+            "checkout_session_id": result.get("checkout_session_id") or session_context.get("checkout_session_id"),
+            "product_interest_note": result.get("product_interest_note"),
+            "inventory_result": result.get("inventory_result"),
+            "negotiation_result": result.get("negotiation_result"),
+            "measurement_result": result.get("measurement_result"),
+            "handover_result": result.get("handover_result"),
+            "handover_pending": result.get("handover_pending"),
+            "customer_contact": result.get("customer_contact"),
+            "custom_image_url": result.get("custom_image_url"),
+            "custom_design_result": result.get("custom_design_result"),
+            "event_type": result.get("event_type"),
+            "product_type": result.get("product_type"),
+            "selected_variation_id": result.get("selected_variation_id"),
+            "selected_variation_name": result.get("selected_variation_name"),
+            "selected_product_variation_id": result.get("selected_product_variation_id"),
+            "selected_product_variation_name": result.get("selected_product_variation_name"),
+            "product_variations": result.get("product_variations") or [],
+            "product_variation_note": result.get("product_variation_note"),
+            "color": result.get("color"),
+            "wedding_date": result.get("wedding_date"),
+            "catalog_categories": result.get("catalog_categories") or [],
+            "catalog_variations": result.get("catalog_variations") or [],
+            "category_variations": result.get("category_variations") or [],
+            "catalog_search_note": result.get("catalog_search_note"),
+            "shown_product_ids": result.get("shown_product_ids") or session_context.get("shown_product_ids") or [],
+            "fabrics": result.get("fabrics") or [],
+            "selected_fabric_catalog_code": result.get("selected_fabric_catalog_code"),
+            "customization_stage": result.get("customization_stage"),
+            "cut_style": result.get("cut_style"),
+        }
+        if settings.INCLUDE_COST_IN_RESPONSE:
+            state_payload["cost"] = get_session_cost(request.session_id)
         return ChatResponse(
             reply=reply,
             imageurl=imageurl,
             executed_nodes=executed_nodes,
-            state={
-                "intent": result.get("intent"),
-                "sales_stage": result.get("sales_stage"),
-                "discovery_next_slot": result.get("discovery_next_slot"),
-                "required_steps": result.get("required_steps"),
-                "executed_nodes": executed_nodes,
-                "buying_intent": result.get("buying_intent"),
-                "selected_product_id": result.get("selected_product_id"),
-                "products": [] if hide_catalog else result.get("products", []),
-                "product_details": None if hide_catalog else result.get("product_details"),
-                "suppress_product_ui": hide_catalog,
-                "checkout_hand_off_note": result.get("checkout_hand_off_note"),
-                "checkout_url": result.get("checkout_url") or session_context.get("checkout_url"),
-                "checkout_session_id": result.get("checkout_session_id") or session_context.get("checkout_session_id"),
-                "product_interest_note": result.get("product_interest_note"),
-                "inventory_result": result.get("inventory_result"),
-                "negotiation_result": result.get("negotiation_result"),
-                "measurement_result": result.get("measurement_result"),
-                "handover_result": result.get("handover_result"),
-                "handover_pending": result.get("handover_pending"),
-                "customer_contact": result.get("customer_contact"),
-                "custom_image_url": result.get("custom_image_url"),
-                "custom_design_result": result.get("custom_design_result"),
-                "event_type": result.get("event_type"),
-                "product_type": result.get("product_type"),
-                "selected_variation_id": result.get("selected_variation_id"),
-                "selected_variation_name": result.get("selected_variation_name"),
-                "selected_product_variation_id": result.get("selected_product_variation_id"),
-                "selected_product_variation_name": result.get("selected_product_variation_name"),
-                "product_variations": result.get("product_variations") or [],
-                "product_variation_note": result.get("product_variation_note"),
-                "color": result.get("color"),
-                "wedding_date": result.get("wedding_date"),
-                "catalog_categories": result.get("catalog_categories") or [],
-                "catalog_variations": result.get("catalog_variations") or [],
-                "category_variations": result.get("category_variations") or [],
-                "catalog_search_note": result.get("catalog_search_note"),
-                "shown_product_ids": result.get("shown_product_ids") or session_context.get("shown_product_ids") or [],
-                "fabrics": result.get("fabrics") or [],
-                "selected_fabric_catalog_code": result.get("selected_fabric_catalog_code"),
-                "customization_stage": result.get("customization_stage"),
-                "cut_style": result.get("cut_style"),
-            },
+            state=state_payload,
         )
     except BackendAPIError as exc:
         logger.exception(
@@ -544,6 +588,29 @@ async def get_session_messages(session_id: str, limit: int = 50):
     return {"session_id": session_id, "messages": messages}
 
 
+@app.get("/sessions/{session_id}/cost")
+async def get_session_ai_cost(session_id: str):
+    """In-memory estimated AI cost for a session (LLM tokens + fal image/try-on)."""
+    cost = get_session_cost(session_id)
+    return {
+        "session_id": session_id,
+        "cost": cost,
+        "langsmith_tracing": bool(settings.LANGSMITH_TRACING),
+        "langsmith_project": settings.LANGSMITH_PROJECT if settings.LANGSMITH_TRACING else None,
+        "note": (
+            "Memory-only estimates for this process. "
+            "Filter LangSmith by metadata.session_id for durable analytics."
+        ),
+    }
+
+
+@app.get("/sessions/{session_id}/quota")
+async def get_session_quota(session_id: str):
+    """Daily limits (hardcoded or RA) + today's usage from session history."""
+    status = await get_quota_status(session_id)
+    return status
+
+
 @app.get("/api/sessions")
 async def list_sessions(limit: int = 50):
     """List recent sessions for workbench switcher."""
@@ -556,6 +623,7 @@ async def clear_session_endpoint(session_id: str):
     """Clear a single session from Redis cache, memory fallback, and PostgreSQL."""
     await memory_service.clear_session(session_id)
     await chat_store.clear_session(session_id)
+    clear_session_cost(session_id)
     logger.info("Session cleared session_id=%s", session_id)
     return {
         "status": "ok",

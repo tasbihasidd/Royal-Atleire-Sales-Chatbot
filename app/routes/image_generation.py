@@ -14,7 +14,9 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 from app.config import settings
 from app.core.logging_config import safe_len
 from app.services.backend_api import backend_api
+from app.services.cost_tracking import session_cost_scope
 from app.services.image_store import image_store
+from app.services.quota_service import require_quota
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +493,30 @@ async def _resolve_fabric_swatch(
 
 @router.post("/api/generate-wedding-image", response_model=WeddingImageResponse)
 async def generate_wedding_image(payload: WeddingImageRequest, request: Request):
+    with session_cost_scope(payload.session_id):
+        return await _generate_wedding_image_impl(payload, request)
+
+
+async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Request):
     try:
+        if not payload.session_id and settings.CHATBOT_QUOTA_ENFORCE:
+            raise HTTPException(
+                status_code=400,
+                detail="session_id is required for custom image generation (quota tracking).",
+            )
+        if payload.session_id:
+            decision = await require_quota(payload.session_id, "custom_image")
+            if not decision.allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "code": "QUOTA_EXCEEDED",
+                        "kind": "custom_image",
+                        "message": decision.message,
+                        "quota": decision.to_dict(),
+                    },
+                )
+
         category = (payload.dress_category or payload.category or "").strip()
         logger.info(
             "Wedding image request start category=%s fabric_code=%s "
