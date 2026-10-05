@@ -7,22 +7,15 @@ services:
     env_file:
       - .env
     environment:
-      # Live / Docker always on 2006; .env stays local-friendly (8015 + localhost DB).
+      # Live / Docker always on 2006; .env stays local-friendly (8015).
       PORT: "2006"
       BASE_URL: http://localhost:2006
       DATABASE_URL: postgresql+asyncpg://royal:royal@postgres:5432/royal_atelier
     depends_on:
-      postgres:
-        condition: service_healthy
+      - postgres
     volumes:
       - royal_atelier_generated_images:/app/static/generated
       - royal_atelier_uploads:/app/static/uploads
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2006/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 40s
     restart: unless-stopped
 
   postgres:
@@ -32,15 +25,9 @@ services:
       POSTGRES_DB: royal_atelier
       POSTGRES_USER: royal
       POSTGRES_PASSWORD: royal
-    ports:
-      - "22006:5432"
+    # No host ports — API reaches it on Docker network: postgres:5432
     volumes:
       - royal_atelier_postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U royal -d royal_atelier"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
     restart: unless-stopped
 
 volumes:
