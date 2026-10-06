@@ -16,7 +16,7 @@ This version includes:
 | **Local** (uvicorn on host) | `http://localhost:8015` | not reachable from host (compose keeps DB internal) — use full `docker compose` or temporarily publish `5432` |
 | **Live / Docker** (`docker compose`) | `http://localhost:2006` | container DNS `postgres:5432` (no host port) |
 
-`.env` is for local host runs. `docker-compose.yml` overrides `PORT`, `BASE_URL`, and `DATABASE_URL` for the API container.
+`.env` is for local and live config. `docker-compose.yml` overrides only `DATABASE_URL` (container DNS). **`PORT` and `BASE_URL` come from `.env`** — compose publishes `${PORT}:${PORT}` (default 2006 if unset). On live set e.g. `PORT=2006` and `BASE_URL=https://your-api-domain.com`.
 
 ## Local (recommended for development)
 
@@ -35,14 +35,23 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8015 --reload
 curl -fsS http://localhost:8015/health
 ```
 
-## Live / Docker (port 2006)
+## Live / Docker
+
+Set `PORT` and `BASE_URL` in `.env` (compose does not hardcode them):
+
+```bash
+PORT=2006
+BASE_URL=http://localhost:2006
+# live server:
+# BASE_URL=https://your-api-domain.com
+```
 
 ```bash
 docker compose up --build -d
-curl -fsS http://localhost:2006/health
+curl -fsS "http://localhost:${PORT:-2006}/health"
 ```
 
-`docker-compose` loads `.env` via `env_file`, so `LANGSMITH_*` and cost rate vars are passed through automatically.
+`docker-compose` loads `.env` via `env_file`, so `PORT`, `BASE_URL`, `LANGSMITH_*`, and cost rate vars are passed through automatically.
 
 ## LangSmith + per-user cost
 

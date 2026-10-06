@@ -3,13 +3,11 @@ services:
     build: .
     container_name: royal_atelier_api
     ports:
-      - "2006:2006"
+      - "${PORT:-2006}:${PORT:-2006}"
     env_file:
       - .env
     environment:
-      # Live / Docker always on 2006; .env stays local-friendly (8015).
-      PORT: "2006"
-      BASE_URL: http://localhost:2006
+      # DB via container DNS. PORT + BASE_URL come from .env.
       DATABASE_URL: postgresql+asyncpg://royal:royal@postgres:5432/royal_atelier
     depends_on:
       - postgres
