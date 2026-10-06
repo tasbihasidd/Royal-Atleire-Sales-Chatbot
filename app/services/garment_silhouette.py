@@ -6,26 +6,46 @@ import re
 
 
 def infer_garment_cut(dress_category: str | None, user_instructions: str) -> str:
-    """Normalize cut key from category + free-text request."""
-    blob = f"{dress_category or ''} {user_instructions or ''}".lower()
+    """
+    Normalize cut key. User free-text wins over dress_category when both name a cut
+    (e.g. brief says '2 piece suit' but category field still says Sherwani).
+    """
+    brief = (user_instructions or "").lower()
+    from_brief = _cut_from_text(brief)
+    if from_brief != "unknown":
+        return from_brief
+    return _cut_from_text((dress_category or "").lower())
+
+
+def _cut_from_text(blob: str) -> str:
+    if not blob:
+        return "unknown"
     if re.search(r"\bprince\s*coat\b|\bbandhgala\b|\bjodhpuri\b", blob):
         return "prince_coat"
     if re.search(r"\bsherwani\b|\bachkan\b", blob):
         return "sherwani"
     if re.search(r"\btuxedo\b|\bdinner\s*jacket\b", blob):
         return "tuxedo"
-    if re.search(r"\bsuit\b|\bblazer\b|\blapel\b", blob):
+    if re.search(r"\b2\s*piece\s*suit\b|\bthree\s*piece\s*suit\b|\b3\s*piece\s*suit\b|\bsuit\b|\bblazer\b", blob):
         return "suit"
-    cat = (dress_category or "").strip().lower()
-    if "prince" in cat:
+    if "prince" in blob:
         return "prince_coat"
-    if "sherwani" in cat:
+    if "sherwani" in blob:
         return "sherwani"
-    if "tuxedo" in cat:
+    if "tuxedo" in blob:
         return "tuxedo"
-    if "suit" in cat:
+    if "suit" in blob:
         return "suit"
     return "unknown"
+
+
+def category_label_for_cut(cut: str, fallback: str | None = None) -> str:
+    return {
+        "prince_coat": "Prince Coat",
+        "sherwani": "Sherwani",
+        "tuxedo": "Tuxedo",
+        "suit": "Suits",
+    }.get(cut) or (fallback or "Wedding menswear")
 
 
 def garment_silhouette_guidance(dress_category: str | None, user_instructions: str) -> str:

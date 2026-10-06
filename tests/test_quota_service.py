@@ -1,13 +1,14 @@
-"""Daily quota service — hardcoded limits + Option A today counts."""
+"""Daily quota service — RA /limits + Option A today counts."""
 
 from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.quota_service import (
     clear_limits_cache,
+    fetch_limits,
     hardcoded_limits,
     karachi_today_bounds_utc,
     require_quota,
@@ -33,6 +34,25 @@ def test_karachi_today_bounds_are_utc_and_one_day():
     assert start.tzinfo is not None
     assert end.tzinfo is not None
     assert (end - start) == timedelta(days=1)
+
+
+def test_fetch_limits_from_backend_daily_fields(monkeypatch):
+    monkeypatch.setattr("app.services.quota_service.settings.CHATBOT_QUOTA_USE_BACKEND", True)
+    mock_api = MagicMock()
+    mock_api.get_chatbot_quotas = AsyncMock(
+        return_value={
+            "success": True,
+            "limits": {
+                "no_of_ai_messages_perday": 50,
+                "no_of_custom_images_perday": 10,
+            },
+        }
+    )
+    with patch("app.services.backend_api.backend_api", mock_api):
+        limits, source = asyncio.run(fetch_limits(force=True))
+    assert source == "royal_attire"
+    assert limits["no_of_ai_messages_perday"] == 50
+    assert limits["no_of_custom_images_perday"] == 10
 
 
 def test_require_quota_blocks_ai_when_at_limit(monkeypatch):

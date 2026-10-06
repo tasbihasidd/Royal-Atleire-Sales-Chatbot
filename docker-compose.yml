@@ -23,7 +23,10 @@ services:
       POSTGRES_DB: royal_atelier
       POSTGRES_USER: royal
       POSTGRES_PASSWORD: royal
-    # No host ports — API reaches it on Docker network: postgres:5432
+    # Host uvicorn only — :5432 is often another project's DB (e.g. tudor).
+    # API container still uses compose override @postgres:5432.
+    ports:
+      - "22006:5432"
     volumes:
       - royal_atelier_postgres_data:/var/lib/postgresql/data
     restart: unless-stopped

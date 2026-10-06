@@ -1170,28 +1170,49 @@ class BackendAPIClient:
 
     async def get_chatbot_quotas(self, session_id: str | None = None) -> dict[str, Any]:
         """
-        GET /chatbot/quotas — daily limits from Royal Attire (when live).
+        GET /limits — daily chatbot quotas from Royal Attire.
 
-        Expected: { success, data: { limits: { no_of_ai_messages_perday, no_of_custom_images_perday } } }
+        Expected:
+        { "status": "success", "data": { "dailyMessageLimit": 50, "dailyImageLimit": 10 } }
         """
-        params: dict[str, Any] = {}
-        if session_id:
-            params["session_id"] = session_id
-        logger.info("Backend API get_chatbot_quotas start session_id=%s", session_id)
-        kwargs: dict[str, Any] = {}
-        if params:
-            kwargs["params"] = params
-        result = await self._request("GET", "/chatbot/quotas", **kwargs)
-        data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else result
+        _ = session_id
+        logger.info("Backend API get_chatbot_quotas start (GET /limits)")
+        result = await self._request("GET", "/limits")
+        data = (
+            result.get("data")
+            if isinstance(result, dict) and isinstance(result.get("data"), dict)
+            else result
+        )
         if not isinstance(data, dict):
             data = {}
+        # Support nested limits{} or flat dailyMessageLimit / dailyImageLimit.
         limits = data.get("limits") if isinstance(data.get("limits"), dict) else data
+        msg = (
+            limits.get("dailyMessageLimit")
+            if limits.get("dailyMessageLimit") is not None
+            else limits.get("no_of_ai_messages_perday")
+            if limits.get("no_of_ai_messages_perday") is not None
+            else limits.get("ai_messages")
+        )
+        img = (
+            limits.get("dailyImageLimit")
+            if limits.get("dailyImageLimit") is not None
+            else limits.get("no_of_custom_images_perday")
+            if limits.get("no_of_custom_images_perday") is not None
+            else limits.get("custom_images")
+        )
+        ok = True
+        if isinstance(result, dict):
+            if "status" in result:
+                ok = str(result.get("status")).lower() in ("success", "ok", "true")
+            elif "success" in result:
+                ok = bool(result.get("success"))
         out = {
-            "success": bool(result.get("success", True)) if isinstance(result, dict) else True,
+            "success": ok,
             "timezone": data.get("timezone") or "Asia/Karachi",
             "limits": {
-                "no_of_ai_messages_perday": limits.get("no_of_ai_messages_perday"),
-                "no_of_custom_images_perday": limits.get("no_of_custom_images_perday"),
+                "no_of_ai_messages_perday": msg,
+                "no_of_custom_images_perday": img,
             },
         }
         logger.info("Backend API get_chatbot_quotas end limits=%s", out["limits"])

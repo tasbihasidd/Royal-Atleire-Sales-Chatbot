@@ -91,11 +91,17 @@ class WeddingImageRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "prompt": "Ivory sherwani with light gold zardozi on collar, clean bandhgala cut, matching shirt and formal shoes, maroon mannequin, minimal studio background",
+                    "prompt": "Black 2 piece suit with white shirt, classic notch lapels, matching trousers and polished black oxfords",
+                    "dress_category": "Suits",
+                    "fabric_catalog_code": "1121043",
+                    "output_format": "png",
+                },
+                {
+                    "prompt": "Ivory sherwani with light gold zardozi on collar, clean bandhgala cut, matching shirt and formal shoes",
                     "dress_category": "Sherwani",
                     "fabric_catalog_code": "FAB-001",
                     "output_format": "png",
-                }
+                },
             ]
         }
     }
@@ -330,8 +336,18 @@ def build_wedding_prompt(
     has_fabric_image: bool = False,
 ) -> str:
     """Compose fal prompt from user free-text + category + fabric analysis."""
-    category = (data.dress_category or data.category or "Wedding menswear").strip()
+    from app.services.garment_silhouette import (
+        category_label_for_cut,
+        garment_silhouette_guidance,
+        infer_garment_cut,
+    )
+
+    requested_category = (data.dress_category or data.category or "Wedding menswear").strip()
     user_brief = (data.prompt or "").strip()
+    # Free-text cut wins when it conflicts with dress_category (Swagger often defaults Sherwani).
+    cut = infer_garment_cut(requested_category, user_brief)
+    category = category_label_for_cut(cut, requested_category)
+    cut_lock = garment_silhouette_guidance(category, user_brief)
 
     if has_fabric_image:
         fabric_section = f"""
@@ -351,6 +367,7 @@ Fabric reference analysis:
 Important design instruction:
 Use the fabric swatch image as the main material reference.
 The outfit must clearly reflect the same fabric colour, weave, texture, pattern mood, and embroidery language.
+The fabric choice does NOT change the garment cut — cut comes from the user design brief.
 """
     else:
         fabric_section = """
@@ -363,22 +380,31 @@ Important design instruction:
 Create the outfit from the user prompt and dress category. Do not invent a named catalogue fabric.
 """
 
+    conflict_note = ""
+    if cut != "unknown" and category.lower() not in requested_category.lower() and requested_category.lower() not in category.lower():
+        conflict_note = (
+            f"\n- NOTE: Request field said '{requested_category}' but user brief requires "
+            f"'{category}'. Generate '{category}' only — do not make a Sherwani/long coat "
+            f"unless the brief asks for it.\n"
+        )
+
     return f"""
 Create a high-end realistic fashion product photograph of a Turabees bespoke wedding outfit.
 
-User design brief (follow closely):
+User design brief (HIGHEST PRIORITY — follow this cut/style exactly):
 {user_brief}
 
 Outfit context:
-- Dress category: {category}
-{fabric_section}
+- Dress category / cut to generate: {category}
+{conflict_note}{fabric_section}
+{cut_lock}
 {design_instruction}
 
 Image requirements:
 - Display the outfit on a maroon / deep burgundy dressmaker mannequin (NOT a human model).
 - Minimal clean photography studio background — soft neutral seamless backdrop, even studio lighting.
 - Full-length mannequin view from form to shoes — complete styled look, never cropped above the ankles.
-- COMPLETE STYLING (mandatory): matching dress shirt under the jacket/sherwani; polished formal shoes (Oxfords/brogues/loafers) clearly visible — NEVER bare mannequin feet; for suits/tuxedos also a coordinated tie or bow tie and pocket square when the cut allows; trousers break cleanly over the shoes.
+- COMPLETE STYLING (mandatory): underlayer matching the cut (dress shirt + tie/bow for suits/tuxedos; appropriate formal inner for sherwani/prince coat); polished formal shoes clearly visible — NEVER bare mannequin feet; trousers/shalwar break cleanly over the shoes.
 - Sharp photorealistic tailoring and fabric drape.
 - No text, no watermark, no logos, no extra people.
 - Commercially presentable for an online bespoke wedding menswear platform.
@@ -518,6 +544,11 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
                 )
 
         category = (payload.dress_category or payload.category or "").strip()
+        from app.services.garment_silhouette import category_label_for_cut, infer_garment_cut
+
+        resolved_cut = infer_garment_cut(category, payload.prompt or "")
+        if resolved_cut != "unknown":
+            category = category_label_for_cut(resolved_cut, category)
         logger.info(
             "Wedding image request start category=%s fabric_code=%s "
             "fabric_url_override=%s output_format=%s",

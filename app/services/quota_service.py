@@ -27,12 +27,12 @@ def clear_limits_cache() -> None:
     _limits_cache_at = 0.0
 
 MSG_AI_EXCEEDED = (
-    "Aaj ki AI chat limit poori ho chuki hai. "
-    "Kal phir try karein, ya Style Consultant se WhatsApp par rabta karein."
+    "Today's AI chat limit has been reached. "
+    "Please try again tomorrow, or contact a Style Consultant on WhatsApp."
 )
 MSG_IMAGE_EXCEEDED = (
-    "Aaj ki custom design image limit poori ho chuki hai. "
-    "Kal naya mockup generate kar sakte hain."
+    "Today's custom design image limit has been reached. "
+    "You can generate a new mockup tomorrow."
 )
 
 
@@ -75,8 +75,8 @@ def hardcoded_limits() -> dict[str, int]:
 async def fetch_limits(*, session_id: str | None = None, force: bool = False) -> tuple[dict[str, int], str]:
     """
     Return (limits, source).
-    While Royal Attire GET is pending, defaults to hardcoded env values unless
-    CHATBOT_QUOTA_USE_BACKEND=true.
+    Primary: Royal Attire GET /limits (dailyMessageLimit / dailyImageLimit).
+    Fallback: env CHATBOT_*_PER_DAY when backend is off or unreachable.
     """
     global _limits_cache, _limits_cache_at
     now = time.monotonic()
@@ -87,7 +87,7 @@ async def fetch_limits(*, session_id: str | None = None, force: bool = False) ->
     ):
         return dict(_limits_cache["limits"]), str(_limits_cache["source"])
 
-    hardcoded = hardcoded_limits()
+    fallback = hardcoded_limits()
     source = "hardcoded"
 
     if settings.CHATBOT_QUOTA_USE_BACKEND:
@@ -97,31 +97,37 @@ async def fetch_limits(*, session_id: str | None = None, force: bool = False) ->
             remote = await backend_api.get_chatbot_quotas(session_id=session_id)
             limits = remote.get("limits") if isinstance(remote, dict) else None
             if isinstance(limits, dict):
-                msg_lim = int(
+                msg_raw = (
                     limits.get("no_of_ai_messages_perday")
-                    or limits.get("ai_messages")
-                    or hardcoded["no_of_ai_messages_perday"]
+                    if limits.get("no_of_ai_messages_perday") is not None
+                    else limits.get("dailyMessageLimit")
+                    if limits.get("dailyMessageLimit") is not None
+                    else limits.get("ai_messages")
                 )
-                img_lim = int(
+                img_raw = (
                     limits.get("no_of_custom_images_perday")
-                    or limits.get("custom_images")
-                    or hardcoded["no_of_custom_images_perday"]
+                    if limits.get("no_of_custom_images_perday") is not None
+                    else limits.get("dailyImageLimit")
+                    if limits.get("dailyImageLimit") is not None
+                    else limits.get("custom_images")
                 )
-                hardcoded = {
-                    "no_of_ai_messages_perday": max(0, msg_lim),
-                    "no_of_custom_images_perday": max(0, img_lim),
+                if msg_raw is None or img_raw is None:
+                    raise ValueError(f"incomplete limits payload: {limits}")
+                fallback = {
+                    "no_of_ai_messages_perday": max(0, int(msg_raw)),
+                    "no_of_custom_images_perday": max(0, int(img_raw)),
                 }
                 source = "royal_attire"
         except Exception:
             logger.warning(
-                "Chatbot quotas backend fetch failed — using hardcoded limits",
+                "Chatbot quotas backend fetch failed — using env/hardcoded fallback limits",
                 exc_info=True,
             )
             source = "hardcoded_fallback"
 
-    _limits_cache = {"limits": hardcoded, "source": source}
+    _limits_cache = {"limits": fallback, "source": source}
     _limits_cache_at = now
-    return dict(hardcoded), source
+    return dict(fallback), source
 
 
 async def get_used_today(session_id: str) -> dict[str, int]:

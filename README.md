@@ -13,8 +13,8 @@ This version includes:
 
 | Mode | API | Postgres |
 |------|-----|----------|
-| **Local** (uvicorn on host) | `http://localhost:8015` | not reachable from host (compose keeps DB internal) — use full `docker compose` or temporarily publish `5432` |
-| **Live / Docker** (`docker compose`) | `http://localhost:2006` | container DNS `postgres:5432` (no host port) |
+| **Local** (uvicorn on host) | `http://localhost:8015` | whatever `DATABASE_URL` in `.env` points to (local/remote Postgres) |
+| **Live / Docker** (`docker compose`) | `http://localhost:${PORT}` | container DNS `postgres:5432` (no host port) |
 
 `.env` is for local and live config. `docker-compose.yml` overrides only `DATABASE_URL` (container DNS). **`PORT` and `BASE_URL` come from `.env`** — compose publishes `${PORT}:${PORT}` (default 2006 if unset). On live set e.g. `PORT=2006` and `BASE_URL=https://your-api-domain.com`.
 
@@ -24,9 +24,8 @@ This version includes:
 cp .env.example .env
 # set FAL_KEY / BACKEND_API_TOKEN as needed
 
-# Postgres only — DB has no host port; for local uvicorn you need a temp port publish
-# or run the full stack: docker compose up --build -d
-docker compose up -d postgres
+# Postgres: use a DB reachable from the host (set DATABASE_URL in .env).
+# Full Docker stack (optional): docker compose up --build -d
 
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8015 --reload
 ```
@@ -96,20 +95,21 @@ curl "http://localhost:8015/sessions/s1/messages"
 
 ## Chatbot daily quotas
 
-Limits (messages / custom images per day) are **hardcoded in env** until Royal Attire ships `GET /chatbot/quotas`. Usage is counted from **today’s** chat + image history (`Asia/Karachi`). Virtual try-on is **not** under this quota.
+Limits come from Royal Attire **`GET …/sales-agent/limits`** (`dailyMessageLimit`, `dailyImageLimit`). Usage is counted from **today’s** chat + image history (`Asia/Karachi`). Virtual try-on is **not** under this quota.
 
 ```bash
 CHATBOT_QUOTA_ENFORCE=true
-CHATBOT_QUOTA_USE_BACKEND=false   # set true when RA GET is live
-CHATBOT_AI_MESSAGES_PER_DAY=10
-CHATBOT_CUSTOM_IMAGES_PER_DAY=2
+CHATBOT_QUOTA_USE_BACKEND=true
+# Optional fallback if /limits is down:
+# CHATBOT_AI_MESSAGES_PER_DAY=10
+# CHATBOT_CUSTOM_IMAGES_PER_DAY=2
 ```
 
 ```bash
 curl "http://localhost:8015/sessions/s1/quota"
 ```
 
-When backend is ready: set `CHATBOT_QUOTA_USE_BACKEND=true` — chatbot calls `GET …/sales-agent/chatbot/quotas` for limits; counting stays local.
+`source` in the quota response is `royal_attire` when the backend limits API succeeds.
 
 ## Where real-time backend APIs connect
 

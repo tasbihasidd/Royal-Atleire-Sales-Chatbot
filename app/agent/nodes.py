@@ -5518,11 +5518,15 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
             variation_name=variation_name,
         )
         if isinstance(result_data, dict) and result_data.get("error") == "quota_exceeded":
+            from app.services.quota_service import MSG_IMAGE_EXCEEDED
+
+            soft = (result_data.get("message") or MSG_IMAGE_EXCEEDED).strip()
             return {
                 "custom_image_url": None,
                 "custom_design_result": result_data,
-                "final_response": result_data.get("message")
-                or "Aaj ki custom design image limit poori ho chuki hai. Kal try karein.",
+                "final_response": soft,
+                # Empty steps so final_response_node short-circuits (no LLM rewrite / price reveal).
+                "required_steps": [],
                 "sales_stage": "customization",
                 "custom_instructions": merged_instructions,
                 "selected_fabric_catalog_code": selected_fabric_code,
@@ -5585,12 +5589,15 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
 @log_node_payload("final_response_node")
 async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
     logger.info("final_response_node start %s", _log_state_summary(state))
-    # Jailbreak / prompt-armor short-circuit — do not overwrite planner reply.
+    # Jailbreak / prompt-armor / quota soft-block — do not overwrite fixed reply.
     preexisting = (state.get("final_response") or "").strip()
-    if preexisting and not (state.get("required_steps") or []):
+    design_err = state.get("custom_design_result") if isinstance(state.get("custom_design_result"), dict) else {}
+    quota_blocked = design_err.get("error") == "quota_exceeded"
+    if preexisting and (quota_blocked or not (state.get("required_steps") or [])):
         logger.info(
-            "final_response_node short-circuit preexisting reply session_id=%s",
+            "final_response_node short-circuit preexisting reply session_id=%s quota_blocked=%s",
             state.get("session_id"),
+            quota_blocked,
         )
         return {
             "final_response": preexisting,
@@ -5805,9 +5812,9 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
         system_prompt_content += f"""
 [CRITICAL — CALCULATOR PRICE READY]
 context.price_quote has list_price={list_price} {currency} (unit_price={unit}).
-- If the customer asks price / qeemat / kitna / cost / pricing: you MUST quote this exact list_price in {currency}.
-- Do NOT say a Style Consultant will quote. Do NOT invent a different number.
-- Do NOT re-describe the image at length — answer the price clearly in 1–2 sentences, then invite checkout or feedback.
+- ONLY if the customer asks about price / qeemat / kitna / cost / pricing: quote this exact list_price in {currency}.
+- If they did NOT ask for price: do NOT mention list_price, GBP, or any number. Continue the design/fabric conversation.
+- Never invent a different figure. Never say a Style Consultant will invent a different price when list_price exists and they asked for price.
 """
 
     neg_pub = context.get("negotiation_result") if isinstance(context.get("negotiation_result"), dict) else None

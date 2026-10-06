@@ -13,6 +13,12 @@ def test_infer_prince_coat_from_instructions():
     assert infer_garment_cut("Prince Coat", "silver grey fabric") == "prince_coat"
 
 
+def test_user_brief_suit_beats_sherwani_category():
+    assert (
+        infer_garment_cut("Sherwani", "Black 2 piece suit with white shirt") == "suit"
+    )
+
+
 def test_prince_coat_guidance_blocks_winter_coat():
     text = garment_silhouette_guidance(
         "Prince Coat",

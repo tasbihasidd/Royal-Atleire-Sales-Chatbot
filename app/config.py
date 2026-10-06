@@ -97,8 +97,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Chatbot daily quotas (Option A). Limits hardcoded until Royal Attire GET is live.
+# Chatbot daily quotas (Option A: count today's history). Limits from RA GET /limits.
 CHATBOT_QUOTA_ENFORCE = _env_bool("CHATBOT_QUOTA_ENFORCE", True)
-CHATBOT_QUOTA_USE_BACKEND = _env_bool("CHATBOT_QUOTA_USE_BACKEND", False)
+CHATBOT_QUOTA_USE_BACKEND = _env_bool("CHATBOT_QUOTA_USE_BACKEND", True)
+# Fallback only when backend /limits is unreachable.
 CHATBOT_AI_MESSAGES_PER_DAY = _env_int("CHATBOT_AI_MESSAGES_PER_DAY", 10)
 CHATBOT_CUSTOM_IMAGES_PER_DAY = _env_int("CHATBOT_CUSTOM_IMAGES_PER_DAY", 2)
 

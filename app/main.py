@@ -244,7 +244,7 @@ async def chat(request: ChatRequest):
                 quota.limits,
             )
             soft = quota.message or (
-                "Aaj ki AI chat limit poori ho chuki hai. Kal phir try karein."
+                "Today's AI chat limit has been reached. Please try again tomorrow."
             )
             return ChatResponse(
                 reply=soft,
