@@ -109,6 +109,17 @@ CHATBOT_QUOTA_USE_BACKEND=true
 curl "http://localhost:8015/sessions/s1/quota"
 ```
 
+Reset today's usage for a session (waives counters; does not delete history). Optional `QUOTA_ADMIN_KEY` → send `X-Admin-Key` header.
+
+```bash
+# Custom image limit only (bespoke generate 429):
+curl -X POST "http://localhost:8015/sessions/YOUR_SESSION_ID/quota/reset?kind=custom_image"
+
+# Chat + images:
+curl -X POST "http://localhost:8015/sessions/YOUR_SESSION_ID/quota/reset?kind=all" \
+  -H "X-Admin-Key: $QUOTA_ADMIN_KEY"
+```
+
 `source` in the quota response is `royal_attire` when the backend limits API succeeds.
 
 ## Where real-time backend APIs connect

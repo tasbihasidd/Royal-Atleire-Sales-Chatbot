@@ -161,6 +161,50 @@ async def get_quota_status(session_id: str) -> dict[str, Any]:
     }
 
 
+async def reset_quota_today(
+    session_id: str,
+    *,
+    kind: Literal["ai_message", "custom_image", "all"] = "custom_image",
+) -> dict[str, Any]:
+    """
+    Admin: waive today's usage for this session so quota counters go back to 0
+    for the selected kind(s). Does not delete chat/image history — marks rows waived.
+    """
+    from app.services.chat_store import chat_store
+    from app.services.image_store import image_store
+
+    start, end = karachi_today_bounds_utc()
+    waived_images = 0
+    waived_messages = 0
+    if kind in ("custom_image", "all"):
+        waived_images = await image_store.waive_images_between(session_id, start, end)
+    if kind in ("ai_message", "all"):
+        waived_messages = await chat_store.waive_user_messages_between(
+            session_id, start, end
+        )
+
+    status = await get_quota_status(session_id)
+    logger.info(
+        "quota reset session_id=%s kind=%s waived_images=%s waived_messages=%s "
+        "remaining_images=%s",
+        session_id,
+        kind,
+        waived_images,
+        waived_messages,
+        status.get("remaining", {}).get("custom_images"),
+    )
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "kind": kind,
+        "waived": {
+            "custom_images": waived_images,
+            "ai_messages": waived_messages,
+        },
+        "quota": status,
+    }
+
+
 async def require_quota(session_id: str, kind: QuotaKind) -> QuotaDecision:
     """Allow if today's used for kind is still under limit (check before consuming)."""
     limits, source = await fetch_limits(session_id=session_id)

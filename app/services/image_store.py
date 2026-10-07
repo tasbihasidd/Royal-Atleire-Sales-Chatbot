@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.services.db import AsyncSessionLocal, GeneratedWeddingImage
 
 logger = logging.getLogger(__name__)
+
+QUOTA_WAIVED_KEY = "_quota_waived"
 
 
 class ImageStore:
@@ -50,27 +52,34 @@ class ImageStore:
             )
             return record.id
 
+    def _is_quota_waived(self, preferences: dict | None) -> bool:
+        if not isinstance(preferences, dict):
+            return False
+        return bool(preferences.get(QUOTA_WAIVED_KEY))
+
     async def count_images_between(
         self,
         session_id: str,
         start: datetime,
         end: datetime,
     ) -> int:
-        """Count custom/wedding image records for session in [start, end)."""
+        """Count custom/wedding image records for session in [start, end).
+
+        Rows marked preferences._quota_waived=true are excluded (admin reset).
+        """
         if not session_id:
             return 0
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(func.count())
-                    .select_from(GeneratedWeddingImage)
-                    .where(
+                    select(GeneratedWeddingImage.preferences).where(
                         GeneratedWeddingImage.session_id == session_id,
                         GeneratedWeddingImage.created_at >= start,
                         GeneratedWeddingImage.created_at < end,
                     )
                 )
-                return int(result.scalar_one() or 0)
+                rows = result.scalars().all()
+                return sum(1 for prefs in rows if not self._is_quota_waived(prefs))
         except Exception as e:
             logger.warning(
                 "count_images_between failed session_id=%s: %s",
@@ -78,6 +87,42 @@ class ImageStore:
                 e,
             )
             return 0
+
+    async def waive_images_between(
+        self,
+        session_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Mark today's (or range) image rows as quota-waived. Returns rows updated."""
+        if not session_id:
+            return 0
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(GeneratedWeddingImage).where(
+                    GeneratedWeddingImage.session_id == session_id,
+                    GeneratedWeddingImage.created_at >= start,
+                    GeneratedWeddingImage.created_at < end,
+                )
+            )
+            rows = list(result.scalars().all())
+            updated = 0
+            for row in rows:
+                prefs = dict(row.preferences or {})
+                if prefs.get(QUOTA_WAIVED_KEY):
+                    continue
+                prefs[QUOTA_WAIVED_KEY] = True
+                row.preferences = prefs
+                updated += 1
+            if updated:
+                await db.commit()
+            logger.info(
+                "waive_images_between session_id=%s updated=%s scanned=%s",
+                session_id,
+                updated,
+                len(rows),
+            )
+            return updated
 
     async def list_recent_records(self, limit: int = 20) -> list[dict]:
         async with AsyncSessionLocal() as db:

@@ -103,6 +103,8 @@ CHATBOT_QUOTA_USE_BACKEND = _env_bool("CHATBOT_QUOTA_USE_BACKEND", True)
 # Fallback only when backend /limits is unreachable.
 CHATBOT_AI_MESSAGES_PER_DAY = _env_int("CHATBOT_AI_MESSAGES_PER_DAY", 10)
 CHATBOT_CUSTOM_IMAGES_PER_DAY = _env_int("CHATBOT_CUSTOM_IMAGES_PER_DAY", 2)
+# Optional: protect POST /sessions/{id}/quota/reset. Empty = open (dev).
+QUOTA_ADMIN_KEY = (os.getenv("QUOTA_ADMIN_KEY") or os.getenv("ADMIN_API_KEY") or "").strip()
 
 
 class Settings(BaseSettings):
@@ -159,6 +161,7 @@ class Settings(BaseSettings):
     CHATBOT_QUOTA_USE_BACKEND: bool = CHATBOT_QUOTA_USE_BACKEND
     CHATBOT_AI_MESSAGES_PER_DAY: int = CHATBOT_AI_MESSAGES_PER_DAY
     CHATBOT_CUSTOM_IMAGES_PER_DAY: int = CHATBOT_CUSTOM_IMAGES_PER_DAY
+    QUOTA_ADMIN_KEY: str = QUOTA_ADMIN_KEY
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

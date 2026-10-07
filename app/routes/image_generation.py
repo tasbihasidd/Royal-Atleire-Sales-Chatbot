@@ -12,9 +12,18 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 from app.config import settings
+from app.constants.fabric_dye_palette import (
+    FABRIC_DYE_COLORS,
+    normalize_fabric_dye_color,
+)
 from app.core.logging_config import safe_len
 from app.services.backend_api import backend_api
 from app.services.cost_tracking import session_cost_scope
+from app.services.fabric_recolor_prompt import (
+    exact_swatch_design_instruction,
+    recolor_design_instruction,
+    swatch_tail_append,
+)
 from app.services.image_store import image_store
 from app.services.quota_service import require_quota
 
@@ -56,8 +65,20 @@ class WeddingImageRequest(BaseModel):
         description="Optional direct fabric swatch URL override (if not using catalog_code)",
     )
     embroidery_tier: Optional[Literal["Light", "Medium", "Heavy"]] = Field(
-        default="Medium",
-        description="Groom embroidery density for the render (default Medium)",
+        default="Light",
+        description=(
+            "Optional SEPARATE tailor thread-work density (default Light). "
+            "Does not invent embroidery onto the fabric surface — swatch weave wins."
+        ),
+    )
+    fabric_dye_color: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional dye/recolor for the selected catalogue fabric. "
+            "When set, swatch supplies weave/texture only; main cloth hue is this palette colour "
+            "(from GET /api/generate-wedding-image/dye-colors)."
+        ),
+        examples=["Maroon"],
     )
     match_bride: bool = Field(
         default=False,
@@ -90,8 +111,9 @@ class WeddingImageRequest(BaseModel):
                     "dress_category": "Sherwani",
                     "fabric_catalog_code": "FAB-001",
                     "embroidery_tier": "Medium",
+                    "fabric_dye_color": "Maroon",
                     "match_bride": True,
-                    "bride_color": "Maroon",
+                    "bride_color": "Ivory",
                     "bride_jewelry_tone": "Gold",
                     "output_format": "png",
                 },
@@ -115,7 +137,18 @@ class WeddingImageRequest(BaseModel):
             if isinstance(val, str) and not val.strip():
                 setattr(self, field, None)
         if self.embroidery_tier is None:
-            self.embroidery_tier = "Medium"
+            self.embroidery_tier = "Light"
+        # Fabric dye: blank → None; invalid → 422.
+        if isinstance(self.fabric_dye_color, str) and not self.fabric_dye_color.strip():
+            self.fabric_dye_color = None
+        if self.fabric_dye_color is not None:
+            normalized = normalize_fabric_dye_color(self.fabric_dye_color)
+            if normalized is None:
+                raise ValueError(
+                    f"fabric_dye_color {self.fabric_dye_color!r} is not in the dye palette. "
+                    "Use GET /api/generate-wedding-image/dye-colors."
+                )
+            self.fabric_dye_color = normalized
         return self
 
 
@@ -152,7 +185,13 @@ class WeddingImageResponse(BaseModel):
     fabric_catalog_code: Optional[str] = None
     dress_category: Optional[str] = None
     embroidery_tier: Optional[str] = None
+    fabric_dye_color: Optional[str] = None
     bride_match: Optional[Dict[str, Any]] = None
+
+
+class DyeColorListResponse(BaseModel):
+    count: int
+    colors: List[str]
 
 
 class FabricListItem(BaseModel):
@@ -173,16 +212,21 @@ class FabricListResponse(BaseModel):
 
 _EMBROIDERY_TIER_GUIDANCE = {
     "Light": (
-        "Embroidery density: Light — minimal, subtle thread work only "
-        "(collar/cuff accents at most). No heavy zardozi panels."
+        "Embroidery density: Light — almost none. At most a very thin collar/cuff thread accent. "
+        "Do NOT add chest panels, floral motifs, or any embroidery that is not on the fabric swatch. "
+        "The cloth body must show only the swatch weave/embossing/self-pattern."
     ),
     "Medium": (
-        "Embroidery density: Medium — balanced formal work on collar, placket, "
-        "and selective panels. Neither plain nor fully covered."
+        "Embroidery density: Medium — light SEPARATE tailor thread-work limited to collar and "
+        "narrow placket edge only. Do NOT invent dense chest embroidery, allover motifs, or a "
+        "second surface pattern. The main coat body must still read as the catalogue fabric "
+        "swatch (weave/embossing only)."
     ),
     "Heavy": (
-        "Embroidery density: Heavy — rich ornate work (zardozi / dense coverage) "
-        "while keeping the fabric weave readable."
+        "Embroidery density: Heavy — richer SEPARATE tailor embroidery (collar/placket/selected "
+        "borders) is allowed, but the underlying cloth weave/embossing from the swatch must "
+        "remain clearly visible between motifs. Do not replace the swatch fabric with a "
+        "different embroidered textile."
     ),
 }
 
@@ -269,7 +313,10 @@ Return ONLY valid JSON in this exact structure:
 
 Rules:
 - Keep it short.
-- Focus on fabric, color, embroidery, pattern and texture.
+- Focus on fabric, color, pattern (weave/embossing/self-jacquard), and texture.
+- embroidery_style: ONLY if actual sewn embroidery/zardozi is visible on the swatch.
+  Embossed geometric weave or self-pattern is NOT embroidery — set embroidery_style to "none".
+- Do not invent embroidery that is not in the photo.
 - Do not add markdown.
 """.strip()
     raw_text = ""
@@ -381,16 +428,25 @@ def build_wedding_prompt(
     category = category_label_for_cut(cut, requested_category)
     cut_lock = garment_silhouette_guidance(category, user_brief)
 
-    tier = (data.embroidery_tier or "Medium").strip().title()
+    tier = (data.embroidery_tier or "Light").strip().title()
     if tier not in _EMBROIDERY_TIER_GUIDANCE:
-        tier = "Medium"
+        tier = "Light"
     embroidery_section = _EMBROIDERY_TIER_GUIDANCE[tier]
 
     bride_section = ""
     if bride_match and bride_match.get("brief"):
         bride_section = f"\n{bride_match['brief']}\n"
 
+    dye_color = (data.fabric_dye_color or "").strip() or None
+
     if has_fabric_image:
+        dye_note = ""
+        if dye_color:
+            photographed = ", ".join(fabric_analysis.get("dominant_colors", []) or []) or "unknown"
+            dye_note = (
+                f"\n- Catalogue swatch photographed as: {photographed} — "
+                f"ignore for final garment hue; dye main cloth to {dye_color}."
+            )
         fabric_section = f"""
 Fabric reference analysis:
 - Catalog fabric name: {fabric_name or "Catalogue swatch"}
@@ -402,24 +458,29 @@ Fabric reference analysis:
 - Texture: {fabric_analysis.get("texture", "")}
 - Visual weight: {fabric_analysis.get("visual_weight", "")}
 - Luxury level: {fabric_analysis.get("luxury_level", "")}
-- Style notes: {fabric_analysis.get("style_notes", "")}
+- Style notes: {fabric_analysis.get("style_notes", "")}{dye_note}
 """
-        design_instruction = """
-Important design instruction:
-Use the fabric swatch image as the main material reference.
-The outfit must clearly reflect the same fabric colour, weave, texture, pattern mood, and embroidery language.
-The fabric choice does NOT change the garment cut — cut comes from the user design brief.
-"""
+        if dye_color:
+            design_instruction = recolor_design_instruction(dye_color)
+        else:
+            design_instruction = exact_swatch_design_instruction()
     else:
         fabric_section = """
 Fabric reference:
 - No fabric swatch image was available.
 - Follow the user's prompt and dress category only.
 """
-        design_instruction = """
+        if dye_color:
+            design_instruction = (
+                f"Important design instruction:\n"
+                f"Create the outfit from the user prompt and dress category. "
+                f"Main outfit fabric colour must be {dye_color}."
+            )
+        else:
+            design_instruction = """
 Important design instruction:
 Create the outfit from the user prompt and dress category. Do not invent a named catalogue fabric.
-"""
+""".strip()
 
     conflict_note = ""
     if cut != "unknown" and category.lower() not in requested_category.lower() and requested_category.lower() not in category.lower():
@@ -447,7 +508,7 @@ Image requirements:
 - Minimal clean photography studio background — soft neutral seamless backdrop, even studio lighting.
 - Full-length mannequin view from head to shoes — complete styled look, never cropped above the ankles.
 - COMPLETE STYLING (mandatory): underlayer matching the cut (dress shirt + tie/bow for suits/tuxedos; appropriate formal inner for sherwani/prince coat); polished formal shoes clearly visible — NEVER bare mannequin feet; trousers/shalwar break cleanly over the shoes.
-- Sharp photorealistic tailoring and fabric drape.
+- Sharp photorealistic tailoring and fabric drape — cloth body matches catalogue swatch surface (no invented embroidery on the textile).
 - No text, no watermark, no logos, no extra people.
 - Commercially presentable for an online bespoke wedding menswear platform.
 """.strip()
@@ -534,6 +595,14 @@ async def list_wedding_image_categories():
         note = "No stocked categories returned from the live catalogue."
     logger.info("wedding_image categories list end count=%s", len(categories))
     return CategoryListResponse(count=len(categories), categories=categories, note=note)
+
+
+@router.get("/api/generate-wedding-image/dye-colors", response_model=DyeColorListResponse)
+async def list_wedding_image_dye_colors():
+    """Shared fabric dye/recolor palette for bespoke Flow 2 (texture from swatch, hue from palette)."""
+    colors = list(FABRIC_DYE_COLORS)
+    logger.info("wedding_image dye-colors list count=%s", len(colors))
+    return DyeColorListResponse(count=len(colors), colors=colors)
 
 
 @router.get("/api/generate-wedding-image/fabrics", response_model=FabricListResponse)
@@ -652,10 +721,12 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
             category = category_label_for_cut(resolved_cut, category)
         logger.info(
             "Wedding image request start category=%s fabric_code=%s "
-            "embroidery=%s match_bride=%s fabric_url_override=%s output_format=%s",
+            "embroidery=%s fabric_dye_color=%s match_bride=%s "
+            "fabric_url_override=%s output_format=%s",
             category,
             payload.fabric_catalog_code,
             payload.embroidery_tier,
+            payload.fabric_dye_color,
             payload.match_bride,
             payload.fabric_image_url is not None,
             payload.output_format,
@@ -692,10 +763,7 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
 
         fabric_urls = [swatch_url] if swatch_url else []
         if fabric_urls:
-            prompt += (
-                "\n\nFigure 1 is the fabric swatch from our catalogue. Apply this exact fabric "
-                "colour, weave, texture, and embroidery onto the full-length outfit. No text."
-            )
+            prompt += swatch_tail_append(dye_color=payload.fabric_dye_color)
         image_bytes = generate_image_bytes_fal(prompt, image_urls=fabric_urls)
 
         filename = save_generated_image(
@@ -738,7 +806,8 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
             metadata=image_metadata,
             fabric_catalog_code=payload.fabric_catalog_code,
             dress_category=category,
-            embroidery_tier=payload.embroidery_tier or "Medium",
+            embroidery_tier=payload.embroidery_tier or "Light",
+            fabric_dye_color=payload.fabric_dye_color,
             bride_match=bride_match,
         )
 

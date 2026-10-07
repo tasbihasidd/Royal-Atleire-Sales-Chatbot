@@ -106,3 +106,33 @@ def test_enforce_off_always_allows(monkeypatch):
     ):
         decision = asyncio.run(require_quota("s-quota", "ai_message"))
     assert decision.allowed is True
+
+
+def test_reset_quota_today_calls_waive(monkeypatch):
+    from app.services.quota_service import reset_quota_today
+
+    waive_img = AsyncMock(return_value=2)
+    waive_msg = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        "app.services.image_store.image_store.waive_images_between",
+        waive_img,
+    )
+    monkeypatch.setattr(
+        "app.services.chat_store.chat_store.waive_user_messages_between",
+        waive_msg,
+    )
+    with patch(
+        "app.services.quota_service.get_quota_status",
+        new=AsyncMock(
+            return_value={
+                "session_id": "s1",
+                "used": {"ai_messages_today": 0, "custom_images_today": 0},
+                "remaining": {"ai_messages": 10, "custom_images": 2},
+            }
+        ),
+    ):
+        result = asyncio.run(reset_quota_today("s1", kind="custom_image"))
+    assert result["status"] == "ok"
+    assert result["waived"]["custom_images"] == 2
+    waive_img.assert_awaited_once()
+    waive_msg.assert_not_awaited()

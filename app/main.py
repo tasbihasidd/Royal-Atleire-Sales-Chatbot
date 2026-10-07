@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -32,7 +32,7 @@ from app.services.cost_tracking import (
     get_session_cost,
     session_cost_scope,
 )
-from app.services.quota_service import get_quota_status, require_quota
+from app.services.quota_service import get_quota_status, require_quota, reset_quota_today
 from app.services.memory_service import memory_service
 from app.schemas.profile import CustomerProfileSchema
 from app.schemas.negotiation import NegotiationStateSchema
@@ -610,6 +610,40 @@ async def get_session_quota(session_id: str):
     """Daily limits (hardcoded or RA) + today's usage from session history."""
     status = await get_quota_status(session_id)
     return status
+
+
+@app.post("/sessions/{session_id}/quota/reset")
+async def reset_session_quota(
+    session_id: str,
+    kind: str = Query(
+        "custom_image",
+        description="What to reset: custom_image | ai_message | all",
+    ),
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+):
+    """
+    Admin: reset today's quota usage for a chatbot session (waive counters, keep history).
+
+    Use when a user hits 429 on generate-wedding-image / chat.
+    If QUOTA_ADMIN_KEY is set in env, pass the same value as header X-Admin-Key.
+    """
+    expected = (settings.QUOTA_ADMIN_KEY or "").strip()
+    if expected and (x_admin_key or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key.")
+
+    kind_norm = (kind or "custom_image").strip().lower()
+    if kind_norm in ("image", "images", "custom_images"):
+        kind_norm = "custom_image"
+    if kind_norm in ("ai", "message", "messages", "ai_messages"):
+        kind_norm = "ai_message"
+    if kind_norm not in ("custom_image", "ai_message", "all"):
+        raise HTTPException(
+            status_code=422,
+            detail="kind must be custom_image, ai_message, or all",
+        )
+
+    result = await reset_quota_today(session_id, kind=kind_norm)  # type: ignore[arg-type]
+    return result
 
 
 @app.get("/api/sessions")

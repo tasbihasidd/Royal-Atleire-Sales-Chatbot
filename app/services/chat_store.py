@@ -11,6 +11,8 @@ from app.services.db import AsyncSessionLocal, ChatMessage, ChatSession
 
 logger = logging.getLogger(__name__)
 
+QUOTA_WAIVED_KEY = "_quota_waived"
+
 # In-memory fallback when Postgres is unavailable (hard-test / degraded env).
 _MEM_SESSIONS: dict[str, dict[str, Any]] = {}
 _MEM_MESSAGES: dict[str, list[dict[str, Any]]] = {}
@@ -404,26 +406,34 @@ class ChatStore:
             msgs = list(_MEM_MESSAGES.get(session_id) or [])
             return msgs[-limit:]
 
+    @staticmethod
+    def _is_quota_waived(meta: dict | None) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        return bool(meta.get(QUOTA_WAIVED_KEY))
+
     async def count_user_messages_between(
         self,
         session_id: str,
         start: datetime,
         end: datetime,
     ) -> int:
-        """Count role=user messages in [start, end) for daily quota (Option A)."""
+        """Count role=user messages in [start, end) for daily quota (Option A).
+
+        Messages with metadata_json._quota_waived=true are excluded (admin reset).
+        """
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
-                    select(func.count())
-                    .select_from(ChatMessage)
-                    .where(
+                    select(ChatMessage.metadata_json).where(
                         ChatMessage.session_id == session_id,
                         ChatMessage.role == "user",
                         ChatMessage.created_at >= start,
                         ChatMessage.created_at < end,
                     )
                 )
-                return int(result.scalar_one() or 0)
+                rows = result.scalars().all()
+                return sum(1 for meta in rows if not self._is_quota_waived(meta))
         except Exception as e:
             logger.warning(
                 "count_user_messages_between DB failed session_id=%s — memory: %s",
@@ -433,6 +443,8 @@ class ChatStore:
             count = 0
             for msg in _MEM_MESSAGES.get(session_id) or []:
                 if msg.get("role") != "user":
+                    continue
+                if self._is_quota_waived(msg.get("metadata_json") or msg.get("metadata")):
                     continue
                 raw = msg.get("created_at")
                 if not raw:
@@ -447,6 +459,71 @@ class ChatStore:
                 except ValueError:
                     count += 1
             return count
+
+    async def waive_user_messages_between(
+        self,
+        session_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Mark today's (or range) user messages as quota-waived. Returns rows updated."""
+        if not session_id:
+            return 0
+        updated = 0
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at >= start,
+                        ChatMessage.created_at < end,
+                    )
+                )
+                rows = list(result.scalars().all())
+                for row in rows:
+                    meta = dict(row.metadata_json or {})
+                    if meta.get(QUOTA_WAIVED_KEY):
+                        continue
+                    meta[QUOTA_WAIVED_KEY] = True
+                    row.metadata_json = meta
+                    updated += 1
+                if updated:
+                    await db.commit()
+        except Exception as e:
+            logger.warning(
+                "waive_user_messages_between DB failed session_id=%s: %s",
+                session_id,
+                e,
+            )
+            updated = 0
+            for msg in _MEM_MESSAGES.get(session_id) or []:
+                if msg.get("role") != "user":
+                    continue
+                meta = dict(msg.get("metadata_json") or msg.get("metadata") or {})
+                if meta.get(QUOTA_WAIVED_KEY):
+                    continue
+                raw = msg.get("created_at")
+                in_range = True
+                if raw:
+                    try:
+                        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        in_range = start <= ts < end
+                    except ValueError:
+                        in_range = True
+                if not in_range:
+                    continue
+                meta[QUOTA_WAIVED_KEY] = True
+                msg["metadata_json"] = meta
+                updated += 1
+        logger.info(
+            "waive_user_messages_between session_id=%s updated=%s",
+            session_id,
+            updated,
+        )
+        return updated
 
     async def clear_session(self, session_id: str) -> None:
         """Delete all chat messages and chat session record for session_id."""
