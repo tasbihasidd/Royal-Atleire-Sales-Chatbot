@@ -215,6 +215,7 @@ def root():
         "message": "Royal Atelier API is running",
         "chat_api": "/chat",
         "image_generation_api": "/api/generate-wedding-image",
+        "wedding_image_categories": "/api/generate-wedding-image/categories",
         "wedding_image_fabrics": "/api/generate-wedding-image/fabrics?category=Sherwani",
         "virtual_tryon_api": "/api/virtual-try-on",
         "health": "/health",

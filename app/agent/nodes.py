@@ -805,18 +805,35 @@ def _message_explicitly_names_garment(
     text = (user_message or "").lower()
     if not text:
         return None
-    # Prefer live catalog names
+    # Prefer live catalog names (allow plural: "prince coats" ↔ "Prince coat")
     for cat in catalog_categories or []:
         name = str(cat.get("name") or "").strip()
-        if name and name.lower() in text:
+        if not name:
+            continue
+        low = name.lower()
+        if low in text:
+            return name
+        # Plural / spacing: "prince coat" inside "prince coats"
+        compact = re.sub(r"\s+", " ", low)
+        if compact and re.search(rf"\b{re.escape(compact)}s?\b", text):
             return name
     if "sherwani" in text:
         return "Sherwani"
-    if "prince coat" in text or "princecoat" in text:
+    if "prince coat" in text or "princecoat" in text or re.search(r"\bprince\s+coats?\b", text):
         return "Prince Coat"
-    if "tuxedo" in text or "suit" in text:
+    if "tuxedo" in text or re.search(r"\bsuits?\b", text):
         return "Suits"
     return None
+
+
+def _is_fresh_category_browse(
+    user_message: str,
+    catalog_categories: list[dict[str, Any]] | None = None,
+) -> bool:
+    """True when customer asks to SEE a garment category (not a named SKU follow-up)."""
+    if not discovery_engine.customer_asked_for_catalog(user_message):
+        return False
+    return bool(_message_explicitly_names_garment(user_message, catalog_categories))
 
 
 def _looks_roman_urdu(text: str) -> bool:
@@ -1389,6 +1406,21 @@ def _match_fabric_from_message(
     return best[1] if best else None
 
 
+def _is_fabric_more_or_browse_ask(message: str | None) -> bool:
+    """True when customer asks to see / see more fabric swatches (not ready-made products)."""
+    text = (message or "").lower().strip()
+    if not text:
+        return False
+    fabric_words = ("fabric", "fabrics", "kapra", "kapray", "cloth", "swatch", "swatches")
+    if not any(w in text for w in fabric_words):
+        return False
+    show_words = (
+        "dikhao", "dekhao", "show", "more", "aur", "available", "options",
+        "list", "kon", "kaun", "hai", "hain", "suggest",
+    )
+    return any(w in text for w in show_words)
+
+
 def _is_fabric_choose_message(message: str | None) -> bool:
     text = (message or "").lower()
     return bool(
@@ -1556,6 +1588,9 @@ _GENERIC_PRODUCT_TOKENS = frozenset(
         "blazer",
         "jacket",
         "coat",
+        "coats",
+        "prince",
+        "princes",
         "piece",
         "pieces",
         "outfit",
@@ -1565,6 +1600,10 @@ _GENERIC_PRODUCT_TOKENS = frozenset(
         "atelier",
         "menswear",
         "wedding",
+        "cut",
+        "classic",
+        "embroidered",
+        "embroidery",
     }
 )
 
@@ -1861,15 +1900,21 @@ def _heuristic_plan(user_message: str, state: SalesAgentState | None = None) -> 
         "options dikhao", "kuch dikhao", "designs dikhao", "collection dikhao", "pieces dikhao",
     ]
     # Never overwrite a fabric-catalogue ask with ready-made product_search.
+    # Category switch ("prince coats dikhao") must search even if a prior SKU is selected.
+    fresh_category = _is_fresh_category_browse(
+        user_message, session.get("catalog_categories") if session else None
+    )
     if (
         not fabric_browse
         and intent != "fabric_custom"
         and any(w in text for w in show_words)
         and not is_seeking_guidance
-        and not session.get("selected_product_id")
+        and (not session.get("selected_product_id") or fresh_category)
     ):
         steps.append("search_products")
         intent = "product_search"
+        if fresh_category:
+            steps = [s for s in steps if s != "get_product_details"]
     elif (
         not fabric_browse
         and intent != "fabric_custom"
@@ -2175,6 +2220,26 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         if not plan.get(field) and heuristic.get(field):
             plan[field] = heuristic[field]
 
+    # Heuristic backup for "show more" / "aur dikhao" when LLM misses the flag.
+    if not wants_more_options and discovery_engine.customer_asked_for_catalog(user_message):
+        low = user_message.lower()
+        if any(
+            cue in low
+            for cue in (
+                "show more",
+                "more options",
+                "aur dikhao",
+                "aur dekhao",
+                "kuch aur",
+                "aur options",
+                "more designs",
+                "more pieces",
+                "aur fabrics",
+                "more fabrics",
+            )
+        ):
+            wants_more_options = True
+
     # Soft guidance ("suggest / no idea"): never lock product_type unless they named a garment.
     if discovery_engine.customer_asked_for_guidance(user_message):
         named_now = _message_explicitly_names_garment(user_message, catalog_categories)
@@ -2471,6 +2536,25 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
 
     fabric_path = intent == "fabric_custom" or "search_fabrics" in required_steps
 
+    # "aur fabrics dikhao" / show-more while already browsing swatches → stay on fabrics.
+    in_fabric_session = bool(
+        state.get("customization_stage") in ("fabric_selection", "cut_style")
+        or state.get("fabrics")
+        or state.get("selected_fabric_catalog_code")
+    )
+    if _is_fabric_more_or_browse_ask(user_message) or (
+        wants_more_options
+        and in_fabric_session
+        and not _message_explicitly_names_garment(user_message, catalog_categories)
+        and not re.search(r"\b(sherwani|suit|suits|prince\s*coat|ready[- ]?made)\b", user_message.lower())
+    ):
+        fabric_path = True
+        intent = "fabric_custom"
+        if "search_fabrics" not in required_steps:
+            required_steps = list(dict.fromkeys([*required_steps, "search_fabrics"]))
+        required_steps = [s for s in required_steps if s not in ("search_products", "get_product_details")]
+        sales_stage = "recommendation"
+
     # Hard gate: search only on dikhao/availability AND discovery prerequisites met.
     if "search_products" in required_steps and not discovery_engine.can_run_product_search(
         profile, user_message, category_variations
@@ -2616,9 +2700,10 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         if slot == "preference":
             variation_note = (
                 f"Customer named {plan.get('event_type') or state.get('event_type') or 'event'}. "
-                "Acknowledge the event with luxury styling taste, suggest the appropriate garment "
-                "(Suits/Tuxedo for Valima/Reception, Sherwani for Barat/Nikkah), "
-                "and ask for their preferences in ONE polite question: season/month, color preference, and approximate budget range. "
+                "Acknowledge the event with luxury styling taste. For Nikkah/Barat suggest 2–3 live "
+                "traditional options from catalog_categories (Sherwani, Prince Coat, Waistcoat when stocked) — "
+                "never Sherwani-only. For Valima/Reception suggest Suits/Tuxedo. "
+                "Then ask preferences in ONE polite question: season/month, color preference, and approximate budget range. "
                 "Do NOT search or dump products yet. Do NOT list prices."
             )
         elif slot == "variation" and category_variations:
@@ -2637,8 +2722,9 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         if slot == "product_type":
             variation_note = (
                 "Customer asked what is available, but garment is not confirmed yet. "
-                "Do NOT search. Briefly suggest the event-fit option from catalog_categories "
-                "(e.g. Sherwani for Nikah) and ask them to confirm the garment. No product dump."
+                "Do NOT search. Briefly suggest 2–3 event-fit options from catalog_categories "
+                "(for Nikah/Barat: Sherwani, Prince Coat, Waistcoat when stocked — never Sherwani-only) "
+                "and ask them to confirm the garment. No product dump."
             )
         elif slot == "variation" and category_variations:
             names = [str(v.get("name")) for v in category_variations if v.get("name")]
@@ -2677,15 +2763,24 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         session_products = list(state.get("products") or [])
     else:
         session_products = []
-    # Pure category browse ("suits dikhao") must show many cards — never lock first SKU.
-    if (
+    # Category browse ("prince coats dikhao") must show cards — unlock sticky Sherwani SKU.
+    # "prince" alone used to false-match "...Sherwani (prince Cut)" and skip search.
+    fresh_category_browse = _is_fresh_category_browse(user_message, catalog_categories)
+    if fresh_category_browse or (
         discovery_engine.customer_asked_for_catalog(user_message)
         and "search_products" in required_steps
         and not _match_product_from_message(user_message, known_products or session_products)
     ):
+        if "search_products" not in required_steps and fresh_category_browse:
+            required_steps = list(dict.fromkeys([*required_steps, "search_products"]))
         required_steps = [s for s in required_steps if s != "get_product_details"]
         selected_product_id = None
         plan["selected_product_id"] = None
+        product_interest_note = None
+        suppress_product_ui = False
+        sales_stage = "recommendation"
+        intent = "product_search"
+        profile.sales_stage = "recommendation"  # type: ignore[assignment]
     confirm_color = plan.get("color") or stated_color
     product_details_state = state.get("product_details") if isinstance(state.get("product_details"), dict) else {}
     if isinstance(product_details_state, dict) and product_details_state.get("error"):
@@ -2697,12 +2792,20 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
     )
     profile_src = state.get("customer_profile") if isinstance(state.get("customer_profile"), dict) else {}
     selected_product_variation_id = (
-        state.get("selected_product_variation_id")
-        or profile_src.get("selected_product_variation_id")
+        None
+        if fresh_category_browse
+        else (
+            state.get("selected_product_variation_id")
+            or profile_src.get("selected_product_variation_id")
+        )
     )
     selected_product_variation_name = (
-        state.get("selected_product_variation_name")
-        or profile_src.get("selected_product_variation_name")
+        None
+        if fresh_category_browse
+        else (
+            state.get("selected_product_variation_name")
+            or profile_src.get("selected_product_variation_name")
+        )
     )
     if not selected_variation_id:
         selected_variation_id = profile_src.get("selected_variation_id") or selected_variation_id
@@ -2710,7 +2813,12 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         selected_variation_name = profile_src.get("selected_variation_name") or selected_variation_name
 
     # Prefer naming a listed product ("Blue Nawab is nice") over colour/id alone.
-    named_product = _match_product_from_message(user_message, known_products or session_products)
+    # Never SKU-lock on a fresh category browse ("prince coats dikhao").
+    named_product = (
+        None
+        if fresh_category_browse
+        else _match_product_from_message(user_message, known_products or session_products)
+    )
     if named_product:
         selected_product_id = str(named_product.get("product_id") or selected_product_id or "")
         if _color_is_only_from_product_name(confirm_color, named_product):
@@ -2811,7 +2919,8 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
             checkout_hand_off_note = None
 
     elif (
-        not awaiting_color
+        not fresh_category_browse
+        and not awaiting_color
         and "calculate_negotiation_offer" not in required_steps
         and (shows_interest or wants_checkout or asks_variation or _is_like_confirm(user_message))
         and (known_products or session_products or selected_product_id)
@@ -2916,8 +3025,12 @@ async def planner_node(state: SalesAgentState) -> dict[str, Any]:
         "gold embroidery", "kaam", "embroidery", "silver work", "gold work"
     )
     # Check if a specific product is named across current + history products / catalog
-    matched_p = _match_product_from_message(user_message, _collect_known_products(state))
-    if not matched_p:
+    matched_p = (
+        None
+        if fresh_category_browse
+        else _match_product_from_message(user_message, _collect_known_products(state))
+    )
+    if not matched_p and not fresh_category_browse:
         try:
             clean_q = _clean_product_search_query(user_message, plan.get("target_product_query"))
             candidate_matches = await backend_api.search_products({"query": clean_q, "limit": 10})
@@ -3396,6 +3509,7 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
     budget = state.get("budget")
     size = state.get("size")
     widened_drops: list[str] = []
+    search_limit = 100 if state.get("wants_more_options") else 50
 
     # Catalogue currency only — no market FX detection.
     products: list[dict[str, Any]] = []
@@ -3410,6 +3524,7 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
             fabric=fabric,
             season=season,
             catalog_categories=catalog_categories,
+            limit=search_limit,
         )
     except BackendAPIError:
         logger.exception(
@@ -3427,6 +3542,7 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
                 fabric=fabric,
                 season=None,
                 catalog_categories=catalog_categories,
+                limit=search_limit,
             )
             if products:
                 backend_unavailable = False
@@ -3494,6 +3610,7 @@ async def search_products_node(state: SalesAgentState) -> dict[str, Any]:
                 fabric=search_fabric,
                 season=search_season,
                 catalog_categories=catalog_categories,
+                limit=search_limit,
             )
         except Exception:
             logger.exception("search_products widen failed drop=%s", dropped)
@@ -3974,8 +4091,35 @@ async def search_fabrics_node(state: SalesAgentState) -> dict[str, Any]:
         return list(await search_fabrics.ainvoke(payload) or [])
 
     widened_drops: list[str] = []
+    catalog_search_note: str | None = None
+    prior_fabrics = [
+        f for f in (state.get("fabrics") or []) if isinstance(f, dict)
+    ]
+    wants_more_fabrics = bool(state.get("wants_more_options")) and bool(prior_fabrics)
     try:
-        fabrics = await _fetch()
+        if wants_more_fabrics:
+            # Next page after what was already shown in-session.
+            fabrics = await _fetch(offset=len(prior_fabrics), limit=100)
+            if fabrics:
+                seen = {
+                    str(f.get("catalog_code") or f.get("id") or "")
+                    for f in prior_fabrics
+                }
+                fresh = [
+                    f
+                    for f in fabrics
+                    if str(f.get("catalog_code") or f.get("id") or "") not in seen
+                ]
+                fabrics = prior_fabrics + fresh if fresh else prior_fabrics + fabrics
+            else:
+                # No next page — re-show full prior set (frontend scrolls all).
+                fabrics = prior_fabrics
+                catalog_search_note = (
+                    "SHORT REPLY: All available fabric swatches for this garment are already on screen. "
+                    "Ask them to scroll the fabric cards and Choose one — do not invent more cloths."
+                )
+        else:
+            fabrics = await _fetch()
     except Exception:
         logger.exception("search_fabrics_node failed session_id=%s", state.get("session_id"))
         raise
@@ -4038,15 +4182,14 @@ async def search_fabrics_node(state: SalesAgentState) -> dict[str, Any]:
         fabrics = [_align_fabric_season_display(f, season_filter) for f in fabrics]
         fabrics.sort(key=lambda f: _fabric_season_sort_key(f, season_filter))
 
-    catalog_search_note = None
-    if fabrics and widened_drops:
+    if catalog_search_note is None and fabrics and widened_drops:
         catalog_search_note = (
             f"Exact fabric filter was empty; widened by relaxing: {', '.join(widened_drops)}. "
             f"SHORT REPLY: ONE line — here are {len(fabrics)} fabric swatch(es) "
             f"(season={season_filter or 'any'}, colour={color_filter or 'any'}). "
             "Frontend cards show the swatches. Do NOT invent fabric names."
         )
-    elif not fabrics:
+    elif catalog_search_note is None and not fabrics:
         event_label = event_type or "this event"
         cat_bit = f" for '{product_type}'" if product_type else ""
         season_bit = f", season {season_filter}" if season_filter else ""

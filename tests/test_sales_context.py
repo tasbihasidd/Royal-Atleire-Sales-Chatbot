@@ -5,7 +5,9 @@ from app.agent.nodes import (
     _build_product_interest_note,
     _heuristic_plan,
     _in_active_negotiation,
+    _is_fresh_category_browse,
     _is_like_confirm,
+    _match_product_from_message,
     _negotiation_awaiting_color,
     _negotiation_last_action,
 )
@@ -73,3 +75,54 @@ def test_close_advance_note_forbids_catalog_dump():
     assert "already selected" in lowered
     assert "here are our options" in lowered
     assert "closing" in lowered or "checkout" in lowered
+
+
+def test_prince_coats_dikhao_does_not_match_prince_cut_sherwani():
+    """'prince' in '(prince Cut)' must not SKU-lock when browsing Prince coats."""
+    products = [
+        {
+            "product_id": "6edfb5f2-9b0e-4a00-becb-21b7c0cb13ab",
+            "name": "Cream Gold Brooch Embroidered Sherwani (prince Cut)",
+        }
+    ]
+    assert _match_product_from_message("mjhay prince coats dikhao", products) is None
+    assert _is_fresh_category_browse(
+        "mjhay prince coats dikhao",
+        [{"name": "Prince coat", "product_count": 6}],
+    )
+
+
+def test_heuristic_prince_coats_dikhao_searches_despite_selected_sku():
+    plan = _heuristic_plan(
+        "mjhay prince coats dikhao",
+        {
+            "selected_product_id": "6edfb5f2-9b0e-4a00-becb-21b7c0cb13ab",
+            "sales_stage": "detail",
+            "product_interest_note": "Customer confirmed they like Cream Gold…",
+            "catalog_categories": [
+                {"name": "Prince coat", "product_count": 6},
+                {"name": "Sherwani", "product_count": 23},
+            ],
+        },
+    )
+    assert "search_products" in plan["required_steps"]
+    assert "get_product_details" not in plan["required_steps"]
+    assert plan["intent"] == "product_search"
+
+
+def test_nikah_event_fit_suggests_prince_coat_and_waistcoat():
+    from app.agent.discovery_engine import discovery_engine
+
+    cats = [
+        {"name": "Sherwani", "product_count": 23},
+        {"name": "Waistcoat", "product_count": 4},
+        {"name": "Prince coat", "product_count": 6},
+        {"name": "Suits", "product_count": 89},
+    ]
+    rule, preferred, avoid = discovery_engine._event_fit_categories("Nikah", cats)
+    preferred_l = [p.lower() for p in preferred]
+    assert any("sherwani" in p for p in preferred_l)
+    assert any("prince" in p for p in preferred_l)
+    assert any("waist" in p for p in preferred_l)
+    assert "sherwani-only" in rule.lower() or "never" in rule.lower()
+    assert not any("prince" in a.lower() for a in avoid)

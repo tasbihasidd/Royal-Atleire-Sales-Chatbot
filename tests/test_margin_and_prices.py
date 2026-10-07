@@ -263,6 +263,29 @@ def test_sanitize_privacy_strips_bare_margin_and_floor():
     assert "[Confidential]" in cleaned
 
 
+def test_sanitize_agent_output_never_appends_manager_discount_note():
+    from app.agent.guardrails import guardrails
+
+    reply = "Janab, aapki pasand ke Prince Coat ki qeemat 204.7 GBP hai."
+    cleaned = guardrails.sanitize_agent_output(
+        reply,
+        {
+            "negotiation_result": {
+                "offered_price": 204.7,
+                "strategy": {"floor_price": 500},
+            }
+        },
+    )
+    assert "manager discount" not in cleaned.lower()
+    assert "pkr" not in cleaned.lower()
+    assert "204.7" in cleaned
+    # Also strip if the model itself leaked the note.
+    leaked = reply + "\n\n(Note: Our maximum authorized manager discount is set to PKR 500.)"
+    cleaned2 = guardrails.sanitize_agent_output(leaked, {})
+    assert "manager discount" not in cleaned2.lower()
+    assert "pkr 500" not in cleaned2.lower()
+
+
 def test_public_negotiation_result_strips_margin_budget():
     from app.agent.nodes import _public_negotiation_result_for_llm
 

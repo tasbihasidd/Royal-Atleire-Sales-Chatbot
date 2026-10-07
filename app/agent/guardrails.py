@@ -41,6 +41,13 @@ CUSTOMER_FACING_LEAK_PATTERNS = [
     re.compile(r"\bsystem[_\s-]?prompt\b", re.IGNORECASE),
     re.compile(r"\bcost[_\s-]?price\b", re.IGNORECASE),
     re.compile(r"\bvendor[_\s-]?code\b", re.IGNORECASE),
+    # Internal manager-discount / floor notes must never reach the customer.
+    re.compile(
+        r"\(?\s*Note:\s*Our maximum authorized manager discount[^.\)\n]*\.?\s*\)?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmaximum authorized manager discount\b", re.IGNORECASE),
+    re.compile(r"\bauthorized manager discount\b", re.IGNORECASE),
 ]
 
 
@@ -103,8 +110,14 @@ class CommercialGuardrails:
         for pattern in CUSTOMER_FACING_LEAK_PATTERNS:
             if pattern.search(sanitized):
                 logger.warning("Privacy Leak Guard sanitized phrase: %s", pattern.pattern)
-                sanitized = pattern.sub("[Confidential]", sanitized)
-        return sanitized
+                # Full internal notes → remove entirely; bare keywords → [Confidential]
+                if "manager discount" in pattern.pattern.lower() or "Note:" in pattern.pattern:
+                    sanitized = pattern.sub("", sanitized)
+                else:
+                    sanitized = pattern.sub("[Confidential]", sanitized)
+        sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+        return sanitized.strip()
 
     def enforce_margin_guard(
         self,
@@ -182,16 +195,27 @@ class CommercialGuardrails:
         clean_text = self.sanitize_unwanted_titles_and_phrases(clean_text)
         clean_text = self.strip_markdown_images(clean_text)
 
-        # 2. Check Margin Guard if negotiation context is present
+        # 2. Margin Guard: log only — NEVER append floor / manager-discount notes to the customer.
         if context and context.get("negotiation_result"):
             neg = context["negotiation_result"]
             offered = neg.get("offered_price")
             strategy = neg.get("strategy") or {}
             floor = strategy.get("floor_price") or (context.get("product_details") or {}).get("floor_price")
-            if offered and floor:
-                is_safe, safe_price = self.enforce_margin_guard(offered, floor)
-                if not is_safe:
-                    clean_text += f"\n\n(Note: Our maximum authorized manager discount is set to PKR {int(safe_price):,}.)"
+            if offered is not None and floor is not None:
+                try:
+                    offered_f = float(offered)
+                    floor_f = float(floor)
+                except (TypeError, ValueError):
+                    offered_f, floor_f = None, None
+                if offered_f is not None and floor_f is not None:
+                    is_safe, safe_price = self.enforce_margin_guard(offered_f, floor_f)
+                    if not is_safe:
+                        logger.warning(
+                            "Margin Guard: offered=%s below floor=%s — suppressed from customer reply "
+                            "(would incorrectly expose internal discount limit)",
+                            offered_f,
+                            safe_price,
+                        )
 
         return clean_text
 

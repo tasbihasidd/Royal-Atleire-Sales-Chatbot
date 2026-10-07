@@ -34,12 +34,12 @@ GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class WeddingImageRequest(BaseModel):
-    """Slim generate body: prompt + category + system fabric (or optional swatch URL)."""
+    """Generate body: prompt + category + fabric + optional embroidery / bride match."""
 
     prompt: str = Field(..., min_length=1, description="Free-text design brief for the outfit image")
     dress_category: Optional[str] = Field(
         default=None,
-        description="Garment category e.g. Sherwani, Suits (alias: category)",
+        description="Garment category from GET /api/generate-wedding-image/categories (alias: category)",
         examples=["Sherwani"],
     )
     category: Optional[str] = Field(
@@ -55,37 +55,25 @@ class WeddingImageRequest(BaseModel):
         default=None,
         description="Optional direct fabric swatch URL override (if not using catalog_code)",
     )
+    embroidery_tier: Optional[Literal["Light", "Medium", "Heavy"]] = Field(
+        default="Medium",
+        description="Groom embroidery density for the render (default Medium)",
+    )
+    match_bride: bool = Field(
+        default=False,
+        description="When true, style the groom to complement the bride (fields below are optional)",
+    )
+    bride_color: Optional[str] = Field(default=None, description="Optional bride dress colour")
+    bride_fabric: Optional[str] = Field(default=None, description="Optional bride fabric note")
+    bride_embroidery: Optional[str] = Field(
+        default=None, description="Optional bride embroidery density/style"
+    )
+    bride_jewelry_tone: Optional[str] = Field(
+        default=None, description="Optional bridal jewellery tone e.g. Gold, Silver"
+    )
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     output_format: Literal["png", "jpeg", "webp"] = "png"
-
-    # --- legacy fields (kept for reference — not accepted on this slim API) ---
-    # religion: str
-    # ceremony: str
-    # wedding_date: date
-    # wedding_time: time_type
-    # location: str
-    # venue_type: str
-    # styles: List[str] = Field(default_factory=list)
-    # colors: List[str] = Field(default_factory=list)
-    # embroidery: List[str] = Field(default_factory=list)
-    # patterns: List[str] = Field(default_factory=list)
-    # fit: str
-    # body_type: str
-    # skin_tone: str
-    # budget: str
-    # delivery_timeline: str
-    # accessories: List[str] = Field(default_factory=list)
-    # footwear: str
-    # wedding_theme: str
-    # personal_preferences: List[str] = Field(default_factory=list)
-    # match_bride: bool = False
-    # bride_color: Optional[str] = None
-    # bride_fabric: Optional[str] = None
-    # bride_embroidery: Optional[str] = None
-    # bride_jewelry_tone: Optional[str] = None
-    # size: str = "1024x1536"
-    # quality: Literal["low", "medium", "high", "auto"] = "medium"
 
     model_config = {
         "json_schema_extra": {
@@ -94,12 +82,17 @@ class WeddingImageRequest(BaseModel):
                     "prompt": "Black 2 piece suit with white shirt, classic notch lapels, matching trousers and polished black oxfords",
                     "dress_category": "Suits",
                     "fabric_catalog_code": "1121043",
+                    "embroidery_tier": "Light",
                     "output_format": "png",
                 },
                 {
                     "prompt": "Ivory sherwani with light gold zardozi on collar, clean bandhgala cut, matching shirt and formal shoes",
                     "dress_category": "Sherwani",
                     "fabric_catalog_code": "FAB-001",
+                    "embroidery_tier": "Medium",
+                    "match_bride": True,
+                    "bride_color": "Maroon",
+                    "bride_jewelry_tone": "Gold",
                     "output_format": "png",
                 },
             ]
@@ -116,6 +109,13 @@ class WeddingImageRequest(BaseModel):
             raise ValueError(
                 "Provide fabric_catalog_code (from fabrics-by-category) or fabric_image_url."
             )
+        # Normalise blank bride strings to None (all optional even when match_bride=true).
+        for field in ("bride_color", "bride_fabric", "bride_embroidery", "bride_jewelry_tone"):
+            val = getattr(self, field)
+            if isinstance(val, str) and not val.strip():
+                setattr(self, field, None)
+        if self.embroidery_tier is None:
+            self.embroidery_tier = "Medium"
         return self
 
 
@@ -129,6 +129,19 @@ class ImageMetadata(BaseModel):
     occasion: str
 
 
+class CategoryListItem(BaseModel):
+    id: Optional[str] = None
+    name: str
+    slug: Optional[str] = None
+    product_count: int = 0
+
+
+class CategoryListResponse(BaseModel):
+    count: int
+    categories: List[CategoryListItem]
+    note: Optional[str] = None
+
+
 class WeddingImageResponse(BaseModel):
     success: bool
     image_url: str
@@ -138,6 +151,8 @@ class WeddingImageResponse(BaseModel):
     metadata: ImageMetadata
     fabric_catalog_code: Optional[str] = None
     dress_category: Optional[str] = None
+    embroidery_tier: Optional[str] = None
+    bride_match: Optional[Dict[str, Any]] = None
 
 
 class FabricListItem(BaseModel):
@@ -154,6 +169,22 @@ class FabricListResponse(BaseModel):
     count: int
     fabrics: List[FabricListItem]
     note: Optional[str] = None
+
+
+_EMBROIDERY_TIER_GUIDANCE = {
+    "Light": (
+        "Embroidery density: Light — minimal, subtle thread work only "
+        "(collar/cuff accents at most). No heavy zardozi panels."
+    ),
+    "Medium": (
+        "Embroidery density: Medium — balanced formal work on collar, placket, "
+        "and selective panels. Neither plain nor fully covered."
+    ),
+    "Heavy": (
+        "Embroidery density: Heavy — rich ornate work (zardozi / dense coverage) "
+        "while keeping the fabric weave readable."
+    ),
+}
 
 
 def clean_json_text(text: str) -> str:
@@ -334,8 +365,9 @@ def build_wedding_prompt(
     *,
     fabric_name: str | None = None,
     has_fabric_image: bool = False,
+    bride_match: Dict[str, Any] | None = None,
 ) -> str:
-    """Compose fal prompt from user free-text + category + fabric analysis."""
+    """Compose fal prompt from user free-text + category + fabric + embroidery + optional bride match."""
     from app.services.garment_silhouette import (
         category_label_for_cut,
         garment_silhouette_guidance,
@@ -348,6 +380,15 @@ def build_wedding_prompt(
     cut = infer_garment_cut(requested_category, user_brief)
     category = category_label_for_cut(cut, requested_category)
     cut_lock = garment_silhouette_guidance(category, user_brief)
+
+    tier = (data.embroidery_tier or "Medium").strip().title()
+    if tier not in _EMBROIDERY_TIER_GUIDANCE:
+        tier = "Medium"
+    embroidery_section = _EMBROIDERY_TIER_GUIDANCE[tier]
+
+    bride_section = ""
+    if bride_match and bride_match.get("brief"):
+        bride_section = f"\n{bride_match['brief']}\n"
 
     if has_fabric_image:
         fabric_section = f"""
@@ -396,19 +437,21 @@ User design brief (HIGHEST PRIORITY — follow this cut/style exactly):
 
 Outfit context:
 - Dress category / cut to generate: {category}
-{conflict_note}{fabric_section}
+- {embroidery_section}
+{conflict_note}{bride_section}{fabric_section}
 {cut_lock}
 {design_instruction}
 
 Image requirements:
 - Display the outfit on a maroon / deep burgundy dressmaker mannequin (NOT a human model).
 - Minimal clean photography studio background — soft neutral seamless backdrop, even studio lighting.
-- Full-length mannequin view from form to shoes — complete styled look, never cropped above the ankles.
+- Full-length mannequin view from head to shoes — complete styled look, never cropped above the ankles.
 - COMPLETE STYLING (mandatory): underlayer matching the cut (dress shirt + tie/bow for suits/tuxedos; appropriate formal inner for sherwani/prince coat); polished formal shoes clearly visible — NEVER bare mannequin feet; trousers/shalwar break cleanly over the shoes.
 - Sharp photorealistic tailoring and fabric drape.
 - No text, no watermark, no logos, no extra people.
 - Commercially presentable for an online bespoke wedding menswear platform.
 """.strip()
+
 
 
 def generate_image_bytes(
@@ -457,6 +500,40 @@ def _slim_fabric_row(row: dict[str, Any]) -> FabricListItem | None:
         color=row.get("color") or row.get("dominant_color"),
         fabric_type=row.get("fabric_type") or row.get("type"),
     )
+
+
+@router.get("/api/generate-wedding-image/categories", response_model=CategoryListResponse)
+async def list_wedding_image_categories():
+    """Live dress categories from Royal Attire catalogue (stocked only)."""
+    logger.info("wedding_image categories list start")
+    try:
+        rows = await backend_api.list_categories()
+    except Exception as exc:
+        logger.exception("wedding_image categories list failed")
+        raise HTTPException(status_code=502, detail=f"Category catalogue unavailable: {exc}") from exc
+
+    categories: list[CategoryListItem] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        count = int(row.get("product_count") or 0)
+        if not name or count <= 0:
+            continue
+        categories.append(
+            CategoryListItem(
+                id=str(row["id"]) if row.get("id") is not None else None,
+                name=name,
+                slug=str(row["slug"]) if row.get("slug") else None,
+                product_count=count,
+            )
+        )
+
+    note = None
+    if not categories:
+        note = "No stocked categories returned from the live catalogue."
+    logger.info("wedding_image categories list end count=%s", len(categories))
+    return CategoryListResponse(count=len(categories), categories=categories, note=note)
 
 
 @router.get("/api/generate-wedding-image/fabrics", response_model=FabricListResponse)
@@ -544,19 +621,55 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
                 )
 
         category = (payload.dress_category or payload.category or "").strip()
+        from app.services.backend_api import resolve_category_against_catalog
+        from app.services.bride_match import build_groom_complement_brief
         from app.services.garment_silhouette import category_label_for_cut, infer_garment_cut
+
+        catalog_categories = await backend_api.list_categories()
+        stocked = [
+            c
+            for c in (catalog_categories or [])
+            if isinstance(c, dict)
+            and str(c.get("name") or "").strip()
+            and int(c.get("product_count") or 0) > 0
+        ]
+        if stocked:
+            resolved_name = resolve_category_against_catalog(category, stocked)
+            live_names = {str(c.get("name") or "").strip().lower() for c in stocked}
+            if not resolved_name or resolved_name.lower() not in live_names:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Unknown dress_category {category!r}. "
+                        "Use a name from GET /api/generate-wedding-image/categories."
+                    ),
+                )
+            category = resolved_name
+            payload.dress_category = resolved_name
 
         resolved_cut = infer_garment_cut(category, payload.prompt or "")
         if resolved_cut != "unknown":
             category = category_label_for_cut(resolved_cut, category)
         logger.info(
             "Wedding image request start category=%s fabric_code=%s "
-            "fabric_url_override=%s output_format=%s",
+            "embroidery=%s match_bride=%s fabric_url_override=%s output_format=%s",
             category,
             payload.fabric_catalog_code,
+            payload.embroidery_tier,
+            payload.match_bride,
             payload.fabric_image_url is not None,
             payload.output_format,
         )
+
+        bride_match: dict[str, Any] | None = None
+        if payload.match_bride:
+            bride_match = build_groom_complement_brief(
+                bride_color=payload.bride_color,
+                bride_fabric=payload.bride_fabric,
+                bride_embroidery=payload.bride_embroidery,
+                bride_jewelry_tone=payload.bride_jewelry_tone,
+                groom_embroidery_tier=payload.embroidery_tier,
+            )
 
         swatch_url, fabric_name, _fabric_row = await _resolve_fabric_swatch(payload)
 
@@ -571,6 +684,7 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
             fabric_analysis,
             fabric_name=fabric_name,
             has_fabric_image=bool(swatch_url),
+            bride_match=bride_match,
         )
         logger.info("Wedding prompt built prompt_length=%s", safe_len(prompt))
 
@@ -624,6 +738,8 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
             metadata=image_metadata,
             fabric_catalog_code=payload.fabric_catalog_code,
             dress_category=category,
+            embroidery_tier=payload.embroidery_tier or "Medium",
+            bride_match=bride_match,
         )
 
     except HTTPException:

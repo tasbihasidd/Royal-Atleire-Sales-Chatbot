@@ -366,17 +366,18 @@ class DiscoveryEngine:
             avoid = pick("sherwani", "prince")
         elif any(x in event for x in ("nikah", "nikkah")):
             rule = (
-                "Nikkah → Sherwani first. Do NOT open with Suit/Tuxedo/Prince Coat "
-                "if Sherwani is in catalog."
+                "Nikkah → traditional formal: name 2–3 live options from catalog "
+                "(Sherwani, Prince Coat, Waistcoat when stocked). "
+                "Do NOT lock to Sherwani-only. Do NOT open with Suit/Tuxedo unless they ask Western."
             )
-            preferred = pick("sherwani")
-            avoid = pick("suit", "tuxedo", "prince")
+            preferred = pick("sherwani", "prince", "waistcoat")
+            avoid = pick("suit", "tuxedo")
         elif any(x in event for x in ("barat", "baraat")):
             rule = (
-                "Barat → Sherwani or Prince Coat (traditional groom). "
+                "Barat → Sherwani, Prince Coat, or Waistcoat (traditional groom). "
                 "Suit only if they ask Western."
             )
-            preferred = pick("sherwani", "prince")
+            preferred = pick("sherwani", "prince", "waistcoat")
             avoid = []
         elif "mehndi" in event or "mehendi" in event or "mehandi" in event:
             rule = "Mehndi → lighter festive options from catalog; less formal than Barat."
@@ -465,8 +466,9 @@ class DiscoveryEngine:
                 "Do NOT dump products or list prices. Keep it to 2-3 polite sentences."
             ) if timing_known else (
                 f"Customer named {event_label}. Do NOT search or dump products this turn! "
-                f"1. Acknowledge {event_label} with luxury styling taste and recommend the appropriate garment: "
-                "(Walima/Reception -> sharp Suits / Tuxedos; Barat -> royal Sherwani or Prince Coat; Nikkah -> graceful Sherwani; Mehndi -> festive Kurta/Sherwani). "
+                f"1. Acknowledge {event_label} with luxury styling taste and recommend appropriate garments from the live catalog: "
+                "(Walima/Reception -> sharp Suits / Tuxedos; Barat / Nikkah -> Sherwani, Prince Coat, and Waistcoat when stocked — never Sherwani-only; Mehndi -> festive Kurta/Sherwani). "
+                "Name 2–3 live traditional options for Nikkah/Barat, then invite which direction they prefer. "
                 "2. Ask for their preferences in ONE polite showroom question in the customer's language covering: "
                 "what month/season the event is in, any specific color preference, and approximate budget range. "
                 "Do NOT dump products or list prices. Keep it to 2-3 polite sentences."
