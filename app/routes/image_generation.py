@@ -25,6 +25,7 @@ from app.services.fabric_recolor_prompt import (
     swatch_tail_append,
 )
 from app.services.image_store import image_store
+from app.services.fal_errors import FalProviderError
 from app.services.quota_service import require_quota
 
 logger = logging.getLogger(__name__)
@@ -813,6 +814,21 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
 
     except HTTPException:
         raise
+
+    except FalProviderError as e:
+        headers = {}
+        if e.retry_after:
+            headers["Retry-After"] = e.retry_after
+        logger.warning(
+            "Wedding image fal provider error code=%s fal_status=%s",
+            e.code,
+            e.fal_status,
+        )
+        raise HTTPException(
+            status_code=e.http_status,
+            detail=e.to_detail(),
+            headers=headers or None,
+        ) from e
 
     except httpx.HTTPStatusError as e:
         raise HTTPException(

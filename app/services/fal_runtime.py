@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextvars import ContextVar
 from typing import Any
+from langsmith.run_helpers import get_current_run_tree
 
 from langsmith import traceable
 
 from app.config import settings
 from app.core.payload_log import print_payload
-from app.services.fal_pricing import resolve_fal_call_usd
 from app.services.cost_tracking import get_session_id, is_image_like_label, record_image_usage
+from app.services.fal_errors import FalProviderError, classify_fal_failure, raise_as_fal_provider_error
+from app.services.fal_pricing import resolve_fal_call_usd
+
+logger = logging.getLogger(__name__)
 
 _last_fal_request_id: ContextVar[str | None] = ContextVar("fal_last_request_id", default=None)
 
@@ -24,15 +29,17 @@ def get_last_fal_request_id() -> str | None:
 def _ensure_fal_key() -> str:
     key = (settings.FAL_KEY or os.getenv("FAL_KEY") or "").strip()
     if not key:
-        raise RuntimeError("FAL_KEY is missing. Set it in .env — OpenRouter is no longer used.")
+        raise FalProviderError(
+            code="FAL_KEY_MISSING",
+            message="FAL_KEY is missing. Set it in the server environment.",
+            http_status=500,
+        )
     os.environ["FAL_KEY"] = key
     return key
 
 
 def _attach_run_metadata(model_id: str, label: str, estimated_cost: float) -> None:
     try:
-        from langsmith.run_helpers import get_current_run_tree
-
         run = get_current_run_tree()
         if run is None:
             return
@@ -52,6 +59,22 @@ def _attach_run_metadata(model_id: str, label: str, estimated_cost: float) -> No
         pass
 
 
+def _reraise_fal(exc: BaseException, *, label: str, model_id: str = "") -> None:
+    if isinstance(exc, FalProviderError):
+        raise exc
+    err = classify_fal_failure(exc)
+    logger.warning(
+        "fal call failed label=%s model=%s code=%s fal_status=%s http=%s msg=%s",
+        label,
+        model_id,
+        err.code,
+        err.fal_status,
+        err.http_status,
+        (err.provider_message or "")[:160],
+    )
+    raise err from exc
+
+
 @traceable(name="fal.subscribe", run_type="tool")
 def subscribe(model_id: str, arguments: dict[str, Any], *, label: str) -> Any:
     import fal_client
@@ -64,11 +87,17 @@ def subscribe(model_id: str, arguments: dict[str, Any], *, label: str) -> Any:
         _last_fal_request_id.set(request_id)
 
     print_payload(f"FAL REQUEST {label} model={model_id}", arguments)
-    result = fal_client.subscribe(
-        model_id,
-        arguments=arguments,
-        on_enqueue=_on_enqueue,
-    )
+    try:
+        result = fal_client.subscribe(
+            model_id,
+            arguments=arguments,
+            on_enqueue=_on_enqueue,
+        )
+    except FalProviderError:
+        raise
+    except Exception as exc:
+        _reraise_fal(exc, label=label, model_id=model_id)
+
     print_payload(f"FAL RESPONSE {label} model={model_id}", result)
 
     image_like = is_image_like_label(label, model_id)
@@ -102,24 +131,34 @@ def upload_image_bytes(data: bytes, *, content_type: str = "image/jpeg", file_na
     _ensure_fal_key()
     # fal_client.upload(data, content_type) — preferred for in-memory bytes
     try:
-        url = fal_client.upload(data, content_type)
-    except TypeError:
-        # Older clients: upload_file needs a path
-        import tempfile
-        from pathlib import Path
-
-        suffix = Path(file_name).suffix or ".jpg"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
         try:
-            url = fal_client.upload_file(tmp_path)
-        finally:
+            url = fal_client.upload(data, content_type)
+        except TypeError:
+            # Older clients: upload_file needs a path
+            import tempfile
+            from pathlib import Path
+
+            suffix = Path(file_name).suffix or ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                url = fal_client.upload_file(tmp_path)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+    except FalProviderError:
+        raise
+    except Exception as exc:
+        raise_as_fal_provider_error(exc)
+
     if not url:
-        raise RuntimeError("fal upload returned empty url")
+        raise FalProviderError(
+            code="FAL_UPSTREAM_ERROR",
+            message="fal upload returned empty url",
+            http_status=502,
+        )
     print_payload("FAL UPLOAD", {"content_type": content_type, "bytes": len(data), "url": url})
     return str(url)

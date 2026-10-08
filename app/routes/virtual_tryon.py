@@ -184,7 +184,11 @@ async def _fetch_image_bytes(url: str, *, label: str) -> tuple[bytes, str]:
     return body, _guess_content_type(url, body, ctype)
 
 
-def _friendly_tryon_error(exc: BaseException) -> tuple[int, str]:
+def _friendly_tryon_error(exc: BaseException) -> tuple[int, str | dict]:
+    from app.services.fal_errors import FalProviderError, classify_fal_failure
+
+    if isinstance(exc, FalProviderError):
+        return exc.http_status, exc.to_detail()
     text = str(exc)
     if re.search(r"unsupported format|valid JPEG|PNG|GIF|WebP", text, re.I):
         return 400, (
@@ -192,6 +196,18 @@ def _friendly_tryon_error(exc: BaseException) -> tuple[int, str]:
         )
     if "FAL_KEY" in text:
         return 500, "FAL_KEY is missing."
+    # fal_client HTTP errors → structured quota / rate-limit detail
+    try:
+        from fal_client.client import FalClientError, FalClientHTTPError
+
+        if isinstance(exc, (FalClientHTTPError, FalClientError)):
+            mapped = classify_fal_failure(exc)
+            return mapped.http_status, mapped.to_detail()
+    except ImportError:
+        pass
+    if re.search(r"quota|credit|billing|rate.?limit|too many requests", text, re.I):
+        mapped = classify_fal_failure(exc)
+        return mapped.http_status, mapped.to_detail()
     return 502, f"Try-on failed: {text[:300]}"
 
 
@@ -242,8 +258,11 @@ async def virtual_tryon(payload: VirtualTryOnRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         status, detail = _friendly_tryon_error(exc)
+        headers = None
+        if isinstance(detail, dict) and detail.get("retry_after"):
+            headers = {"Retry-After": str(detail["retry_after"])}
         logger.exception("virtual_tryon failed model=%s", model_id)
-        raise HTTPException(status_code=status, detail=detail) from exc
+        raise HTTPException(status_code=status, detail=detail, headers=headers) from exc
 
     filename = f"{uuid.uuid4()}.png"
     (GENERATED_DIR / filename).write_bytes(result["image_bytes"])

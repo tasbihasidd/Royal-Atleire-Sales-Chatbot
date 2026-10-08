@@ -32,6 +32,7 @@ from app.services.cost_tracking import (
     get_session_cost,
     session_cost_scope,
 )
+from app.services.fal_errors import FalProviderError
 from app.services.quota_service import get_quota_status, require_quota, reset_quota_today
 from app.services.memory_service import memory_service
 from app.schemas.profile import CustomerProfileSchema
@@ -559,6 +560,30 @@ async def chat(request: ChatRequest):
             metadata={"backend_error": True, "status_code": exc.status_code},
         )
         return ChatResponse(reply=soft, imageurl=None, executed_nodes=[], state={"backend_error": True})
+    except FalProviderError as exc:
+        logger.warning(
+            "Chat fal provider error session_id=%s code=%s fal_status=%s",
+            request.session_id,
+            exc.code,
+            exc.fal_status,
+        )
+        soft = exc.message
+        await chat_store.add_message(
+            session_id=request.session_id,
+            role="assistant",
+            content=soft,
+            metadata={"fal_error": True, "code": exc.code, "fal_status": exc.fal_status},
+        )
+        return ChatResponse(
+            reply=soft,
+            imageurl=None,
+            executed_nodes=[],
+            state={
+                "fal_error": True,
+                "fal_quota_exceeded": exc.code in ("FAL_QUOTA_EXCEEDED", "FAL_RATE_LIMITED"),
+                "fal": exc.to_detail(),
+            },
+        )
     except Exception:
         logger.exception("Chat request failed session_id=%s", request.session_id)
         soft = (

@@ -7,6 +7,7 @@ from app.routes.image_generation import (
     default_fabric_analysis,
     generate_image_metadata,
 )
+from app.services.fal_errors import FalProviderError
 from app.services.fal_image import generate_image_bytes_fal
 from app.services.garment_silhouette import garment_silhouette_guidance
 from app.services.image_store import image_store
@@ -237,6 +238,18 @@ Image Aesthetics & Presentation Requirements:
         logger.info("generate_bespoke_design complete session_id=%s image_url=%s", session_id, image_url)
         return image_url, result_data
         
+    except FalProviderError as e:
+        logger.warning(
+            "generate_bespoke_design fal error session_id=%s code=%s",
+            session_id,
+            e.code,
+        )
+        return None, {
+            "error": "fal_provider_error",
+            "code": e.code,
+            "message": e.message,
+            "fal": e.to_detail(),
+        }
     except Exception as e:
         logger.exception("generate_bespoke_design failed")
         raise e

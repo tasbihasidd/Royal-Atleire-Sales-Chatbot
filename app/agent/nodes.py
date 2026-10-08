@@ -5676,6 +5676,22 @@ async def generate_custom_design_node(state: SalesAgentState) -> dict[str, Any]:
                 "product_details": None,
                 "products": [],
             }
+        if isinstance(result_data, dict) and result_data.get("error") == "fal_provider_error":
+            soft = (
+                result_data.get("message")
+                or "Our AI design studio is temporarily at capacity. Please try again shortly."
+            ).strip()
+            return {
+                "custom_image_url": None,
+                "custom_design_result": result_data,
+                "final_response": soft,
+                "required_steps": [],
+                "sales_stage": "customization",
+                "custom_instructions": merged_instructions,
+                "selected_fabric_catalog_code": selected_fabric_code,
+                "product_details": None,
+                "products": [],
+            }
         out: dict[str, Any] = {
             "custom_image_url": image_url,
             "custom_design_result": result_data,
@@ -5735,7 +5751,7 @@ async def final_response_node(state: SalesAgentState) -> dict[str, Any]:
     # Jailbreak / prompt-armor / quota soft-block — do not overwrite fixed reply.
     preexisting = (state.get("final_response") or "").strip()
     design_err = state.get("custom_design_result") if isinstance(state.get("custom_design_result"), dict) else {}
-    quota_blocked = design_err.get("error") == "quota_exceeded"
+    quota_blocked = design_err.get("error") in ("quota_exceeded", "fal_provider_error")
     if preexisting and (quota_blocked or not (state.get("required_steps") or [])):
         logger.info(
             "final_response_node short-circuit preexisting reply session_id=%s quota_blocked=%s",
