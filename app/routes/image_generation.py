@@ -566,7 +566,7 @@ def _slim_fabric_row(row: dict[str, Any]) -> FabricListItem | None:
 
 @router.get("/api/generate-wedding-image/categories", response_model=CategoryListResponse)
 async def list_wedding_image_categories():
-    """Live dress categories from Royal Attire catalogue (stocked only)."""
+    """Live dress categories from Royal Attire catalogue (prefer stocked)."""
     logger.info("wedding_image categories list start")
     try:
         rows = await backend_api.list_categories()
@@ -574,27 +574,55 @@ async def list_wedding_image_categories():
         logger.exception("wedding_image categories list failed")
         raise HTTPException(status_code=502, detail=f"Category catalogue unavailable: {exc}") from exc
 
-    categories: list[CategoryListItem] = []
+    def _to_item(row: dict[str, Any]) -> CategoryListItem | None:
+        name = str(row.get("name") or "").strip()
+        if not name:
+            return None
+        # Skip inactive when the flag is present and false.
+        if row.get("is_active") is False:
+            return None
+        try:
+            count = int(row.get("product_count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return CategoryListItem(
+            id=str(row["id"]) if row.get("id") is not None else None,
+            name=name,
+            slug=str(row["slug"]) if row.get("slug") else None,
+            product_count=count,
+        )
+
+    named: list[CategoryListItem] = []
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        name = str(row.get("name") or "").strip()
-        count = int(row.get("product_count") or 0)
-        if not name or count <= 0:
-            continue
-        categories.append(
-            CategoryListItem(
-                id=str(row["id"]) if row.get("id") is not None else None,
-                name=name,
-                slug=str(row["slug"]) if row.get("slug") else None,
-                product_count=count,
-            )
-        )
+        item = _to_item(row)
+        if item:
+            named.append(item)
+
+    stocked = [c for c in named if c.product_count > 0]
+    # Prefer stocked; if counts are missing/zero but names exist, still return them
+    # so bespoke UI is not blank when upstream omits _count.
+    categories = stocked if stocked else named
 
     note = None
-    if not categories:
-        note = "No stocked categories returned from the live catalogue."
-    logger.info("wedding_image categories list end count=%s", len(categories))
+    if not named:
+        note = (
+            "No categories returned from the live catalogue. "
+            "Check BACKEND_API_BASE_URL / token on this host, then retry "
+            "(category cache clears within ~30s after a failed fetch)."
+        )
+    elif not stocked:
+        note = (
+            "Catalogue categories returned without positive product counts; "
+            "showing all named categories."
+        )
+    logger.info(
+        "wedding_image categories list end named=%s stocked=%s returned=%s",
+        len(named),
+        len(stocked),
+        len(categories),
+    )
     return CategoryListResponse(count=len(categories), categories=categories, note=note)
 
 

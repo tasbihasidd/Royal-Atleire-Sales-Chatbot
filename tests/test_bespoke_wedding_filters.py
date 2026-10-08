@@ -106,3 +106,20 @@ def test_categories_endpoint_filters_stocked(monkeypatch):
     names = [c.name for c in resp.categories]
     assert names == ["Sherwani", "Prince coat"]
     assert resp.count == 2
+
+
+def test_categories_endpoint_falls_back_when_counts_zero(monkeypatch):
+    import asyncio
+
+    from app.routes import image_generation as ig
+
+    async def fake_list():
+        return [
+            {"id": "1", "name": "Sherwani", "slug": "sherwani", "product_count": 0},
+            {"id": "2", "name": "Suits", "slug": "suits", "product_count": 0},
+        ]
+
+    monkeypatch.setattr(ig.backend_api, "list_categories", fake_list)
+    resp = asyncio.run(ig.list_wedding_image_categories())
+    assert [c.name for c in resp.categories] == ["Sherwani", "Suits"]
+    assert resp.note and "without positive product counts" in resp.note

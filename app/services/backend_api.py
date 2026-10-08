@@ -23,13 +23,38 @@ _MAX_RETRIES = 2
 _BASE_BACKOFF_S = 0.4
 _MAX_BACKOFF_S = 8.0
 
-# Process-lifetime caches for catalog metadata (planner fetches every turn).
+# Catalog metadata caches (TTL — never lock empty forever after one upstream blip).
 _categories_cache: list[dict[str, Any]] | None = None
 _variations_cache: list[dict[str, Any]] | None = None
 _size_charts_cache: list[dict[str, Any]] | None = None
-_categories_cache_failed = False
-_variations_cache_failed = False
-_size_charts_cache_failed = False
+_categories_cache_at: float = 0.0
+_variations_cache_at: float = 0.0
+_size_charts_cache_at: float = 0.0
+_categories_failed_at: float | None = None
+_variations_failed_at: float | None = None
+_size_charts_failed_at: float | None = None
+_CATEGORIES_TTL_S = 120.0
+_CATEGORIES_FAIL_TTL_S = 30.0
+_VARIATIONS_TTL_S = 120.0
+_VARIATIONS_FAIL_TTL_S = 30.0
+_SIZE_CHARTS_TTL_S = 300.0
+_SIZE_CHARTS_FAIL_TTL_S = 60.0
+
+
+def clear_catalog_caches() -> None:
+    """Reset category / variation / size-chart caches (tests + admin recovery)."""
+    global _categories_cache, _variations_cache, _size_charts_cache
+    global _categories_cache_at, _variations_cache_at, _size_charts_cache_at
+    global _categories_failed_at, _variations_failed_at, _size_charts_failed_at
+    _categories_cache = None
+    _variations_cache = None
+    _size_charts_cache = None
+    _categories_cache_at = 0.0
+    _variations_cache_at = 0.0
+    _size_charts_cache_at = 0.0
+    _categories_failed_at = None
+    _variations_failed_at = None
+    _size_charts_failed_at = None
 
 
 class BackendAPIError(Exception):
@@ -1374,14 +1399,21 @@ class BackendAPIClient:
 
     async def list_categories(self) -> list[dict[str, Any]]:
         """GET /api/v2/categories — live catalog category names and product counts."""
-        global _categories_cache, _categories_cache_failed
+        global _categories_cache, _categories_cache_at, _categories_failed_at
         if settings.USE_MOCK_DATA:
             mock = _get_mock_service()
             return mock.list_mock_categories()
 
-        if _categories_cache is not None:
+        now = time.monotonic()
+        if (
+            _categories_cache is not None
+            and (now - _categories_cache_at) < _CATEGORIES_TTL_S
+        ):
             return list(_categories_cache)
-        if _categories_cache_failed:
+        if (
+            _categories_failed_at is not None
+            and (now - _categories_failed_at) < _CATEGORIES_FAIL_TTL_S
+        ):
             return []
 
         url = f"{self._api_v2_root()}/categories"
@@ -1390,8 +1422,12 @@ class BackendAPIClient:
         try:
             payload = await self._request_url("GET", url, path_label="/categories")
         except BackendAPIError:
-            _categories_cache_failed = True
-            logger.exception("Backend API list_categories failed — caching empty for process lifetime")
+            _categories_failed_at = now
+            _categories_cache = None
+            logger.exception(
+                "Backend API list_categories failed — empty for %.0fs then retry",
+                _CATEGORIES_FAIL_TTL_S,
+            )
             return []
         duration_ms = (time.perf_counter() - start) * 1000
 
@@ -1406,35 +1442,58 @@ class BackendAPIClient:
         for item in raw_list:
             if not isinstance(item, dict):
                 continue
-            count_block = item.get("_count") or {}
+            count_block = item.get("_count") if isinstance(item.get("_count"), dict) else {}
             product_count = count_block.get("products")
             if product_count is None:
-                product_count = item.get("product_count") or item.get("products_count") or 0
+                product_count = (
+                    item.get("product_count")
+                    or item.get("products_count")
+                    or item.get("productCount")
+                    or 0
+                )
+            try:
+                product_count_i = int(product_count or 0)
+            except (TypeError, ValueError):
+                product_count_i = 0
+            name = item.get("name")
+            if not str(name or "").strip():
+                continue
             categories.append(
                 {
                     "id": item.get("id"),
-                    "name": item.get("name"),
+                    "name": name,
                     "slug": item.get("slug"),
-                    "product_count": int(product_count or 0),
+                    "product_count": product_count_i,
+                    "is_active": bool(item.get("isActive", item.get("is_active", True))),
                 }
             )
         _categories_cache = categories
+        _categories_cache_at = now
+        _categories_failed_at = None
         logger.info(
-            "Backend API list_categories end count=%s duration_ms=%.2f",
+            "Backend API list_categories end count=%s stocked=%s duration_ms=%.2f",
             len(categories),
+            sum(1 for c in categories if int(c.get("product_count") or 0) > 0),
             duration_ms,
         )
         return list(categories)
 
     async def list_variations(self) -> list[dict[str, Any]]:
         """GET /api/v2/variations — live category style variations (not fixed)."""
-        global _variations_cache, _variations_cache_failed
+        global _variations_cache, _variations_cache_at, _variations_failed_at
         if settings.USE_MOCK_DATA:
             return []
 
-        if _variations_cache is not None:
+        now = time.monotonic()
+        if (
+            _variations_cache is not None
+            and (now - _variations_cache_at) < _VARIATIONS_TTL_S
+        ):
             return list(_variations_cache)
-        if _variations_cache_failed:
+        if (
+            _variations_failed_at is not None
+            and (now - _variations_failed_at) < _VARIATIONS_FAIL_TTL_S
+        ):
             return []
 
         url = f"{self._api_v2_root()}/variations"
@@ -1443,8 +1502,12 @@ class BackendAPIClient:
         try:
             payload = await self._request_url("GET", url, path_label="/variations")
         except BackendAPIError:
-            _variations_cache_failed = True
-            logger.exception("Backend API list_variations failed — caching empty for process lifetime")
+            _variations_failed_at = now
+            _variations_cache = None
+            logger.exception(
+                "Backend API list_variations failed — empty for %.0fs then retry",
+                _VARIATIONS_FAIL_TTL_S,
+            )
             return []
         duration_ms = (time.perf_counter() - start) * 1000
 
@@ -1483,6 +1546,8 @@ class BackendAPIClient:
                 }
             )
         _variations_cache = variations
+        _variations_cache_at = now
+        _variations_failed_at = None
         logger.info(
             "Backend API list_variations end count=%s duration_ms=%.2f",
             len(variations),
@@ -1492,14 +1557,21 @@ class BackendAPIClient:
 
     async def list_size_charts(self) -> list[dict[str, Any]]:
         """GET {api_v2_root}/size-charts → data.sizeCharts (same host as categories, not /sales-agent)."""
-        global _size_charts_cache, _size_charts_cache_failed
+        global _size_charts_cache, _size_charts_cache_at, _size_charts_failed_at
         if settings.USE_MOCK_DATA:
             mock = _get_mock_service()
             return mock.list_mock_size_charts()
 
-        if _size_charts_cache is not None:
+        now = time.monotonic()
+        if (
+            _size_charts_cache is not None
+            and (now - _size_charts_cache_at) < _SIZE_CHARTS_TTL_S
+        ):
             return list(_size_charts_cache)
-        if _size_charts_cache_failed:
+        if (
+            _size_charts_failed_at is not None
+            and (now - _size_charts_failed_at) < _SIZE_CHARTS_FAIL_TTL_S
+        ):
             return []
 
         url = f"{self._api_v2_root()}/size-charts"
@@ -1508,8 +1580,12 @@ class BackendAPIClient:
         try:
             payload = await self._request_url("GET", url, path_label="/size-charts")
         except BackendAPIError:
-            _size_charts_cache_failed = True
-            logger.exception("Backend API list_size_charts failed — caching empty for process lifetime")
+            _size_charts_failed_at = now
+            _size_charts_cache = None
+            logger.exception(
+                "Backend API list_size_charts failed — empty for %.0fs then retry",
+                _SIZE_CHARTS_FAIL_TTL_S,
+            )
             return []
         duration_ms = (time.perf_counter() - start) * 1000
 
@@ -1526,6 +1602,8 @@ class BackendAPIClient:
                 continue
             charts.append(_normalize_size_chart(item))
         _size_charts_cache = charts
+        _size_charts_cache_at = now
+        _size_charts_failed_at = None
         logger.info(
             "Backend API list_size_charts end count=%s duration_ms=%.2f",
             len(charts),
