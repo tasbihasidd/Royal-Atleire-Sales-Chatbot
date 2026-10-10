@@ -52,6 +52,7 @@ SESSION_CONTEXT_KEYS = (
     "sales_stage",
     "buying_intent",
     "negotiation_state",
+    "negotiation_result",
     "selected_fabric_catalog_code",
     "fabrics",
     "declined_slots",
@@ -121,6 +122,15 @@ def _patch_session_context(existing: dict[str, Any], metadata: dict[str, Any]) -
         elif key in ("negotiation_state",):
             if value is not None:
                 merged[key] = value
+        elif key == "negotiation_result":
+            if value is not None:
+                from app.services.checkout_service import slim_negotiation_result_for_session
+
+                slim = slim_negotiation_result_for_session(value)
+                if slim is None:
+                    merged.pop("negotiation_result", None)
+                else:
+                    merged["negotiation_result"] = slim
         elif value:
             merged[key] = value
 
@@ -297,6 +307,14 @@ class ChatStore:
             context["product_variations"] = result["product_variations"]
         if result.get("negotiation_state") is not None:
             context["negotiation_state"] = result["negotiation_state"]
+        if "negotiation_result" in result:
+            from app.services.checkout_service import slim_negotiation_result_for_session
+
+            slim = slim_negotiation_result_for_session(result.get("negotiation_result"))
+            if slim is None:
+                context.pop("negotiation_result", None)
+            else:
+                context["negotiation_result"] = slim
         if result.get("fabrics"):
             context["fabrics"] = result["fabrics"]
         if result.get("custom_image_url"):

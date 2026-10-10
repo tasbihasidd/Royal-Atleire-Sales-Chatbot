@@ -73,7 +73,11 @@ from app.agent.guardrails import guardrails
 from app.schemas.profile import CustomerProfileSchema
 from app.schemas.negotiation import NegotiationStateSchema
 from app.services.custom_design_service import generate_bespoke_design
-from app.services.checkout_service import build_checkout_request, is_custom_checkout
+from app.services.checkout_service import (
+    build_checkout_items,
+    build_checkout_request,
+    is_custom_checkout,
+)
 from app.services.price_quote_service import public_price_quote, resolve_sellable_price
 
 
@@ -1732,6 +1736,7 @@ def _build_checkout_hand_off_note(
     variation_name: str | None = None,
     color: str | None = None,
     negotiated: bool = False,
+    complimentary_accessory: str | None = None,
 ) -> str:
     bits = []
     if product_name:
@@ -1742,9 +1747,16 @@ def _build_checkout_hand_off_note(
         bits.append(f"colour {color}")
     label = ", ".join(bits) if bits else "this piece"
     neg = " after negotiation" if negotiated else ""
+    gift = ""
+    if complimentary_accessory:
+        gift = (
+            f" Cart includes complimentary accessory: {complimentary_accessory} "
+            "(already attached on the checkout link — do not invent another gift)."
+        )
     return (
-        f"Customer is ready to checkout{neg} on {label}. "
+        f"Customer is ready to checkout{neg} on {label}.{gift} "
         f"Reply briefly with name/price (use negotiated offered_price if present), "
+        f"mention the complimentary accessory by name when present, "
         f"then give this exact checkout_url: {checkout_url}. "
         "They open that link, sign in, and complete order (size etc. there). "
         "Do NOT invent a cart URL, catalog product_url, or ask size, bespoke, measurements, or phone."
@@ -4740,7 +4752,79 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
             {k: quote.get(k) for k in ("ok", "error", "source", "unit_price")} if quote else None,
         )
 
+    # Complimentary CUSTOM gifts need the accessory catalogue image — ACCESSORY auto-fetch
+    # does not apply. Enrich from GET /accessories/{id} when image_url is missing.
+    if isinstance(negotiation, dict) and negotiation.get("free_accessory"):
+        full = negotiation.get("accessories_full") or []
+        if isinstance(full, list) and full and isinstance(full[0], dict):
+            gift0 = full[0]
+            if not (gift0.get("image_url") or gift0.get("imageUrl")):
+                aid = str(gift0.get("accessory_id") or gift0.get("id") or "").strip()
+                if aid:
+                    try:
+                        fetched = await backend_api.get_accessory(aid)
+                    except Exception:
+                        logger.exception(
+                            "close_sale_node get_accessory for gift image failed id=%s",
+                            aid,
+                        )
+                        fetched = None
+                    if isinstance(fetched, dict) and (fetched.get("image_url") or fetched.get("name")):
+                        enriched = dict(gift0)
+                        if fetched.get("image_url"):
+                            enriched["image_url"] = fetched.get("image_url")
+                        if fetched.get("name") and not enriched.get("name"):
+                            enriched["name"] = fetched.get("name")
+                        if fetched.get("accessory_type") and not enriched.get("accessory_type"):
+                            enriched["accessory_type"] = fetched.get("accessory_type")
+                        negotiation = {**negotiation, "accessories_full": [enriched] + list(full[1:])}
+                        state_for_checkout["negotiation_result"] = negotiation
+                        logger.info(
+                            "close_sale_node enriched complimentary gift image session_id=%s accessory_id=%s",
+                            state.get("session_id"),
+                            aid,
+                        )
+
     payload = build_checkout_request(state_for_checkout)
+    # Safety net: if gift SKUs are on negotiation_result but missing from items, rebuild.
+    gift_name: str | None = None
+    if isinstance(negotiation, dict) and negotiation.get("free_accessory"):
+        full = negotiation.get("accessories_full") or []
+        if isinstance(full, list) and full and isinstance(full[0], dict):
+            gift_name = str(full[0].get("name") or "").strip() or None
+        items = list((payload or {}).get("items") or []) if payload else []
+
+        def _has_gift_line(rows: list) -> bool:
+            for it in rows:
+                if not isinstance(it, dict):
+                    continue
+                itype = str(it.get("item_type") or "").upper()
+                if itype == "ACCESSORY":
+                    return True
+                # Complimentary gifts ship as CUSTOM @ unit_price 0 (API ignores ACCESSORY overrides).
+                if itype == "CUSTOM":
+                    attrs = it.get("custom_attributes") if isinstance(it.get("custom_attributes"), dict) else {}
+                    if attrs.get("complimentary") or attrs.get("accessory_id"):
+                        try:
+                            if float(it.get("unit_price") or 0) == 0:
+                                return True
+                        except (TypeError, ValueError):
+                            pass
+            return False
+
+        if not _has_gift_line(items) and full:
+            rebuilt = build_checkout_items(state_for_checkout)
+            if _has_gift_line(rebuilt):
+                payload = {
+                    "user_id": str(state_for_checkout.get("session_id") or "guest"),
+                    "user_type": "GUEST",
+                    "items": rebuilt,
+                }
+                logger.info(
+                    "close_sale_node merged complimentary gift line session_id=%s gift=%s",
+                    state.get("session_id"),
+                    gift_name,
+                )
     close_result["checkout_payload"] = payload
     if isinstance(quote, dict) and quote.get("ok"):
         close_result["list_price"] = quote.get("list_price")
@@ -4790,12 +4874,19 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
             close_result["status"] = "ready_for_checkout_link"
             close_result["checkout_url"] = checkout_url
             close_result["checkout_session_id"] = checkout_session_id
+            # Prefer gift name from actual payload ACCESSORY line when present.
+            if not gift_name and isinstance(payload.get("items"), list):
+                for it in payload["items"]:
+                    if isinstance(it, dict) and str(it.get("item_type") or "").upper() == "ACCESSORY":
+                        # name may only live on negotiation_result
+                        break
             checkout_note = _build_checkout_hand_off_note(
                 checkout_url=str(checkout_url),
                 product_name=str(product_name) if product_name else None,
                 variation_name=state.get("selected_product_variation_name"),
                 color=state.get("color"),
-                negotiated=bool(offered),
+                negotiated=bool(offered) or bool(negotiation.get("free_accessory")),
+                complimentary_accessory=gift_name,
             )
         else:
             close_result["status"] = "checkout_link_failed"
@@ -4938,23 +5029,22 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
     session_color = state.get("color") or state.get("selected_color") or _extract_explicit_color(
         state.get("user_message") or ""
     )
-    product_color, product_available_colors, color_pending = resolve_garment_color_for_accessory(
+    product_color, product_available_colors, _color_pending = resolve_garment_color_for_accessory(
         session_color,
         product_available_colors,
     )
     next_round = int((state.get("negotiation_state") or {}).get("round_number") or 0) + 1
-    # Round 1 is value defence — colour ask only starts when we would gift (round 2+).
-    ask_color_before_gift = bool(color_pending and next_round >= 2)
 
     accessory_rows: list[dict[str, Any]] = []
     bundle_offer: dict[str, Any] | None = None
-    # Prefetch matching accessories for Round 2 (and later rounds reuse in result).
-    if product_category and next_round >= 2 and not ask_color_before_gift:
+    # Prefetch accessories for Round 2+ — no colour-pending gate; colour/event
+    # matching filters are skipped (API stock + category + margin only).
+    if product_category and next_round >= 2:
         try:
             recommended = await backend_api.recommend_accessories(
                 category=str(product_category),
                 product_id=str(details.get("product_id") or "") or None,
-                event_type=str(event_type) if event_type else None,
+                event_type=None,
                 main_product_price=float(price),
                 limit=6,
             )
@@ -4973,18 +5063,18 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
                     list_price=float(price),
                     floor_price=floor_for_margin,
                     product_category=product_category,
-                    event_type=str(event_type) if event_type else None,
+                    event_type=None,
                     bundle_offer=bundle_offer,
                     currency=product_currency,
-                    product_color=product_color,
+                    product_color=None,
                     limit=1,
                 )
             else:
                 accessory_rows = filter_accessories_for_product(
                     raw_acc,
                     product_category=product_category,
-                    event_type=str(event_type) if event_type else None,
-                    product_color=product_color,
+                    event_type=None,
+                    product_color=None,
                     limit=1,
                 )
             # If recommend returned poorly matched rows, fall back to search + filter.
@@ -4992,7 +5082,6 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
                 searched = await backend_api.search_accessories(
                     {
                         "category": product_category,
-                        "event_type": event_type,
                         "limit": 8,
                     }
                 )
@@ -5002,55 +5091,21 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
                         list_price=float(price),
                         floor_price=floor_for_margin,
                         product_category=product_category,
-                        event_type=str(event_type) if event_type else None,
+                        event_type=None,
                         bundle_offer=bundle_offer,
                         currency=product_currency,
-                        product_color=product_color,
+                        product_color=None,
                         limit=1,
                     )
                 else:
                     accessory_rows = filter_accessories_for_product(
                         searched,
                         product_category=product_category,
-                        event_type=str(event_type) if event_type else None,
-                        product_color=product_color,
-                        limit=1,
-                    )
-            # Empty-only broaden: retry accessories without event_type (keep margin filter).
-            if not accessory_rows:
-                searched_broad = await backend_api.search_accessories(
-                    {
-                        "category": product_category,
-                        "limit": 8,
-                    }
-                )
-                if is_free_qual:
-                    accessory_rows = filter_free_gift_candidates(
-                        searched_broad,
-                        list_price=float(price),
-                        floor_price=floor_for_margin,
-                        product_category=product_category,
                         event_type=None,
-                        bundle_offer=bundle_offer,
-                        currency=product_currency,
-                        product_color=product_color,
+                        product_color=None,
                         limit=1,
                     )
-                else:
-                    accessory_rows = filter_accessories_for_product(
-                        searched_broad,
-                        product_category=product_category,
-                        event_type=None,
-                        product_color=product_color,
-                        limit=1,
-                    )
-                if accessory_rows:
-                    logger.info(
-                        "negotiation accessories broadened without event session_id=%s count=%s",
-                        state.get("session_id"),
-                        len(accessory_rows),
-                    )
-            # Second empty-only broaden: drop category too (still margin-filtered).
+            # Empty-only broaden: drop category too (still margin-filtered).
             if not accessory_rows:
                 searched_any = await backend_api.search_accessories({"limit": 8})
                 if is_free_qual:
@@ -5062,7 +5117,7 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
                         event_type=None,
                         bundle_offer=bundle_offer,
                         currency=product_currency,
-                        product_color=product_color,
+                        product_color=None,
                         limit=1,
                     )
                 else:
@@ -5070,7 +5125,7 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
                         searched_any,
                         product_category=product_category,
                         event_type=None,
-                        product_color=product_color,
+                        product_color=None,
                         limit=1,
                     )
                 if accessory_rows:
@@ -5109,7 +5164,8 @@ async def calculate_negotiation_offer_node(state: SalesAgentState) -> dict[str, 
         margin_budget=margin_budget,
         product_color=product_color,
         product_colors=product_available_colors,
-        color_pending=ask_color_before_gift,
+        # Colour matching is ops/backend-owned — never block gifts on colour_pending.
+        color_pending=False,
     )
 
     alternative_products: list[dict[str, Any]] = []

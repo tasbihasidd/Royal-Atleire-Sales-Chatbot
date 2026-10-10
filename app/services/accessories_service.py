@@ -278,8 +278,11 @@ def filter_accessories_for_product(
     """
     Keep accessories that pair with the garment (and event when listed).
     When max_price is set (free-gift path), only keep 0 < price ≤ max_price.
-    When product_color is set, filter and prioritize by color match.
+
+    product_color is accepted for call-site compatibility but is NOT used to exclude
+    or rank accessories — catalogue colour matching is handled upstream / ops.
     """
+    _ = product_color  # ignored by design
     filtered: list[dict[str, Any]] = []
     eligible_fold = {_fold_label(t) for t in (eligible_types or []) if t}
 
@@ -297,15 +300,7 @@ def filter_accessories_for_product(
                 price = 0.0
             if price <= 0 or price > float(max_price):
                 continue
-        # Color matching: filter out clashing colours when a specific garment colour is set
-        if product_color and is_specific_garment_color(product_color):
-            acc_colors = item.get("available_colors") or []
-            matches, score = color_matches_product(acc_colors, product_color)
-            if not matches:
-                continue
-            item = dict(item)
-            item["_color_score"] = score  # Temporary field for sorting
-        filtered.append(item)
+        filtered.append(dict(item))
 
     # Fallback: if event matching excluded all items, keep items that match category
     if not filtered and accessories and max_price is None:
@@ -313,7 +308,7 @@ def filter_accessories_for_product(
             if not isinstance(item, dict):
                 continue
             if category_matches_pairs(product_category, item.get("pairs_with_categories")):
-                filtered.append(item)
+                filtered.append(dict(item))
 
     if eligible_fold:
         preferred = [
@@ -328,13 +323,7 @@ def filter_accessories_for_product(
                 if _fold_label(str(a.get("accessory_type") or "")) not in eligible_fold
             ]
 
-    # Prefer better color matches, then cheaper within margin
-    if product_color and is_specific_garment_color(product_color):
-        # Sort by color score descending (3=exact, 2=complement, 1=neutral), then by price
-        filtered.sort(
-            key=lambda a: (-a.get("_color_score", 0), float(a.get("price") or 0))
-        )
-    elif max_price is not None:
+    if max_price is not None:
         # Prefer cheaper gifts within margin (protect margin further)
         filtered.sort(key=lambda a: float(a.get("price") or 0))
 
@@ -348,22 +337,19 @@ def filter_accessories_for_product(
             continue
         if key:
             seen.add(key)
-        # Clean up temporary sorting field
-        item.pop("_color_score", None)
         unique.append(item)
         if len(unique) >= limit:
             break
 
     logger.info(
         "filter_accessories_for_product category=%s event=%s in=%s out=%s "
-        "eligible_types=%s max_price=%s product_color=%s",
+        "eligible_types=%s max_price=%s (product_color ignored)",
         product_category,
         event_type,
         len(accessories),
         len(unique),
         eligible_types,
         max_price,
-        product_color,
     )
     return unique
 
@@ -381,6 +367,7 @@ def filter_free_gift_candidates(
     limit: int = 1,
 ) -> list[dict[str, Any]]:
     """Margin-safe free gift pool: accessory.price ≤ (list − floor) ∩ max_free_value."""
+    _ = product_color  # colour matching not applied — show API accessories within margin
     margin = free_gift_margin_budget(list_price, floor_price, bundle_offer)
     if margin <= 0:
         logger.info("filter_free_gift_candidates empty — margin_budget=0")
@@ -392,7 +379,7 @@ def filter_free_gift_candidates(
         event_type=event_type,
         eligible_types=eligible,
         max_price=margin,
-        product_color=product_color,
+        product_color=None,
         limit=limit,
     )
 

@@ -334,6 +334,8 @@ async def chat(request: ChatRequest):
             "negotiation_state": negotiation_state.model_dump()
             if not session_context.get("negotiation_state")
             else session_context.get("negotiation_state"),
+            # Complimentary gift SKUs for checkout attach (persisted across turns).
+            "negotiation_result": session_context.get("negotiation_result"),
             "selected_fabric_catalog_code": profile.selected_fabric_catalog_code
             or session_context.get("selected_fabric_catalog_code"),
             "fabrics": session_context.get("fabrics") or [],

@@ -70,7 +70,8 @@ def test_resolve_single_available_color_auto_selects():
     assert pending is False
 
 
-def test_filter_returns_one_color_matched_accessory():
+def test_filter_ignores_product_color_keeps_first_within_limit():
+    """Colour is no longer used to exclude — API rows that pair with category are kept."""
     accessories = [
         {
             "accessory_id": "white",
@@ -101,7 +102,34 @@ def test_filter_returns_one_color_matched_accessory():
         limit=1,
     )
     assert len(out) == 1
-    assert out[0]["name"] == "Black shawl"
+    assert out[0]["name"] == "White shawl"
+
+
+def test_silver_grey_garment_still_gets_pagri_gift():
+    """Regression: Silver Grey must not empty the gift pool (ops matches colours)."""
+    accessories = [
+        {
+            "accessory_id": "pagri-1",
+            "name": "Royal Heritage Pagri - Champagne Crest Safa",
+            "accessory_type": "Turban / Pagri",
+            "price": 85,
+            "pairs_with_categories": ["Sherwani"],
+            "available_colors": ["Maroon", "Gold", "Ivory", "Rust", "Emerald Green", "Deep Navy"],
+        },
+    ]
+    gifted = filter_free_gift_candidates(
+        accessories,
+        list_price=1000,
+        floor_price=50,
+        product_category="Sherwani",
+        currency="GBP",
+        product_color="Silver Grey",
+        event_type="NIKAH",
+        bundle_offer={"type": "DISCOUNT", "discount_percent": 50},
+        limit=1,
+    )
+    assert len(gifted) == 1
+    assert "Pagri" in gifted[0]["name"]
 
 
 def test_free_gift_limit_one_within_margin():

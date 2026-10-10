@@ -76,7 +76,10 @@ def test_custom_plus_accessory_payload():
         }
     )
     assert items[0]["item_type"] == "CUSTOM"
-    assert items[1] == {"item_type": "ACCESSORY", "accessory_id": ACCESSORY_ID}
+    assert items[1]["item_type"] == "CUSTOM"
+    assert items[1]["unit_price"] == 0
+    assert items[1]["custom_attributes"]["accessory_id"] == ACCESSORY_ID
+    assert items[1]["custom_attributes"]["complimentary"] is True
 
 
 def test_accessory_not_added_during_defend_round():
@@ -93,6 +96,202 @@ def test_accessory_not_added_during_defend_round():
     )
     assert len(items) == 1
     assert items[0]["item_type"] == "STANDARD"
+
+
+def test_session_context_persists_gift_for_next_turn_checkout():
+    """Turn A offer → context; Turn B hydrate → ACCESSORY on checkout payload."""
+    from app.services.checkout_service import slim_negotiation_result_for_session
+
+    store = ChatStore()
+    offer = {
+        "approved": True,
+        "free_accessory": True,
+        "action": "offer_free_accessory",
+        "accessories": ["Royal Heritage Pagri - Sapphire Crest Safa"],
+        "accessories_full": [
+            {
+                "accessory_id": ACCESSORY_ID,
+                "name": "Royal Heritage Pagri - Sapphire Crest Safa",
+                "accessory_type": "Turban / Pagri",
+                "price": 85,
+                "available_colors": ["Maroon", "Gold"],
+            }
+        ],
+        "prompt_directive": "long text should not all persist",
+        "strategy": {"action": "offer_free_accessory"},
+    }
+    context = store.build_session_context_from_result({"negotiation_result": offer}, {})
+    slim = context["negotiation_result"]
+    assert slim["free_accessory"] is True
+    assert slim["accessories_full"][0]["accessory_id"] == ACCESSORY_ID
+    assert "strategy" not in slim
+    assert "prompt_directive" not in slim
+
+    # Simulate next-turn state hydrated only from session context (no in-memory gift).
+    payload = build_checkout_request(
+        {
+            "session_id": "sess-gift",
+            "selected_product_id": CATALOG_ID,
+            "product_details": {"name": "Champagne Gold Leaf Embroidered Sherwani", "product_id": CATALOG_ID},
+            "negotiation_result": slim,
+        }
+    )
+    assert payload is not None
+    assert len(payload["items"]) == 2
+    assert payload["items"][0]["item_type"] == "STANDARD"
+    gift = payload["items"][1]
+    assert gift["item_type"] == "CUSTOM"
+    assert gift["unit_price"] == 0
+    assert gift["custom_attributes"]["accessory_id"] == ACCESSORY_ID
+    assert "Pagri" in gift["item_name_snapshot"]
+
+    # Defend round clears persisted gift.
+    cleared = store.build_session_context_from_result(
+        {"negotiation_result": {"action": "defend_value", "approved": False}},
+        context,
+    )
+    assert "negotiation_result" not in cleared or cleared.get("negotiation_result") is None
+    assert slim_negotiation_result_for_session({"action": "defend_value"}) is None
+
+
+def test_close_sale_attaches_persisted_complimentary_pagri():
+    state = {
+        "session_id": "sess-pagri",
+        "selected_product_id": CATALOG_ID,
+        "product_details": {"name": "Champagne Gold Leaf Embroidered Sherwani", "product_id": CATALOG_ID},
+        "customer_contact": {},
+        "inventory_result": {},
+        "products": [],
+        "negotiation_result": {
+            "approved": True,
+            "free_accessory": True,
+            "action": "offer_free_accessory",
+            "accessories_full": [
+                {"accessory_id": ACCESSORY_ID, "name": "Royal Heritage Pagri - Sapphire Crest Safa"}
+            ],
+        },
+    }
+    mock_resp = {
+        "success": True,
+        "checkout_url": CHECKOUT_URL,
+        "session_id": "281dc7e0",
+    }
+    pagri_img = "https://cdn.example.com/accessories/pagri.webp"
+    with (
+        patch(
+            "app.agent.nodes._refresh_price_quote",
+            new=AsyncMock(
+                return_value={
+                    "price_quote": {
+                        "ok": True,
+                        "unit_price": 1000,
+                        "list_price": 1000,
+                        "source": "catalogue",
+                    }
+                }
+            ),
+        ),
+        patch(
+            "app.agent.nodes.backend_api.get_accessory",
+            new=AsyncMock(
+                return_value={
+                    "accessory_id": ACCESSORY_ID,
+                    "name": "Royal Heritage Pagri - Sapphire Crest Safa",
+                    "image_url": pagri_img,
+                }
+            ),
+        ),
+        patch(
+            "app.agent.nodes.backend_api.create_checkout_session",
+            new=AsyncMock(return_value=mock_resp),
+        ) as mock_checkout,
+    ):
+        out = asyncio.run(close_sale_node(state))
+    body = mock_checkout.await_args.args[0]
+    assert len(body["items"]) == 2
+    gift_line = body["items"][1]
+    assert gift_line["item_type"] == "CUSTOM"
+    assert gift_line["unit_price"] == 0
+    assert gift_line["custom_attributes"]["accessory_id"] == ACCESSORY_ID
+    assert gift_line["custom_attributes"]["generated_image_url"] == pagri_img
+    note = out.get("checkout_hand_off_note") or ""
+    assert "Pagri" in note or "complimentary" in note.lower()
+    assert CHECKOUT_URL in note
+
+
+def test_complimentary_accessory_is_zero_priced_not_catalogue():
+    """Gift pagri must not inflate bag total (e.g. £1000 + £85 → £1085).
+
+    Turabees ignores unit_price on ACCESSORY, so complimentary gifts go as CUSTOM @ 0.
+    """
+    pagri_img = "https://cdn.example.com/accessories/pagri.webp"
+    items = build_checkout_items(
+        {
+            "selected_product_id": CATALOG_ID,
+            "product_details": {
+                "name": "Champagne Gold Leaf Embroidered Sherwani",
+                "product_id": CATALOG_ID,
+                "price": 1000,
+            },
+            "negotiation_result": {
+                "approved": True,
+                "free_accessory": True,
+                "action": "offer_free_accessory",
+                "accessories_full": [
+                    {
+                        "accessory_id": ACCESSORY_ID,
+                        "name": "Royal Heritage Pagri - Sapphire Crest Safa",
+                        "price": 85,
+                        "image_url": pagri_img,
+                    }
+                ],
+            },
+        }
+    )
+    assert len(items) == 2
+    assert items[0]["item_type"] == "STANDARD"
+    assert items[1]["item_type"] == "CUSTOM"
+    assert items[1]["unit_price"] == 0
+    assert items[1]["custom_attributes"]["accessory_id"] == ACCESSORY_ID
+    assert items[1]["custom_attributes"]["generated_image_url"] == pagri_img
+    assert items[1]["custom_attributes"]["image_url"] == pagri_img
+    # Paid upsell keeps catalogue ACCESSORY pricing.
+    paid = build_checkout_items(
+        {
+            "selected_product_id": CATALOG_ID,
+            "product_details": {"product_id": CATALOG_ID},
+            "negotiation_result": {
+                "approved": True,
+                "free_accessory": False,
+                "action": "offer_paid_accessory_upsell",
+                "accessories_full": [{"accessory_id": ACCESSORY_ID, "price": 85}],
+            },
+        }
+    )
+    assert paid[1] == {"item_type": "ACCESSORY", "accessory_id": ACCESSORY_ID}
+    assert "unit_price" not in paid[1]
+
+
+def test_slim_persists_gift_image_url():
+    from app.services.checkout_service import slim_negotiation_result_for_session
+
+    slim = slim_negotiation_result_for_session(
+        {
+            "approved": True,
+            "free_accessory": True,
+            "action": "offer_free_accessory",
+            "accessories_full": [
+                {
+                    "accessory_id": ACCESSORY_ID,
+                    "name": "Royal Heritage Pagri",
+                    "image_url": "https://cdn.example.com/pagri.webp",
+                    "available_colors": ["Gold"],
+                }
+            ],
+        }
+    )
+    assert slim is not None
+    assert slim["accessories_full"][0]["image_url"] == "https://cdn.example.com/pagri.webp"
 
 
 def test_close_sale_puts_checkout_url_on_state():

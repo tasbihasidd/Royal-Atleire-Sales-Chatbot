@@ -137,20 +137,98 @@ def _custom_attributes(state: dict[str, Any]) -> dict[str, Any]:
     return attrs
 
 
+_GIFT_BLOCK_ACTIONS = frozenset(
+    ("cutoff_and_pivot", "budget_pivot", "defend_value", "ask_color_preference")
+)
+_GIFT_OFFER_ACTIONS = frozenset(
+    ("offer_free_accessory", "offer_bundle", "reinforce_gift_or_consultant", "offer_paid_accessory_upsell")
+)
+
+
+def slim_negotiation_result_for_session(negotiation: Any) -> dict[str, Any] | None:
+    """
+    Persist a lean gift slice across chat turns so close_sale can attach ACCESSORY.
+
+    Returns None when there is no complimentary gift to keep (clears prior gift).
+    """
+    if not isinstance(negotiation, dict) or not negotiation:
+        return None
+    action = str(negotiation.get("action") or "")
+    if action in _GIFT_BLOCK_ACTIONS:
+        return None
+    free = bool(negotiation.get("free_accessory"))
+    if not free and not negotiation.get("approved"):
+        return None
+    raw = negotiation.get("accessories_full") or []
+    accessories_full: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("accessory_id") or item.get("id") or "").strip()
+        if not aid:
+            continue
+        image_url = item.get("image_url") or item.get("imageUrl")
+        if not image_url:
+            images = item.get("images") or []
+            if isinstance(images, list) and images:
+                first = images[0]
+                if isinstance(first, str):
+                    image_url = first
+                elif isinstance(first, dict):
+                    image_url = first.get("url") or first.get("image_url")
+        accessories_full.append(
+            {
+                "accessory_id": aid,
+                "name": item.get("name"),
+                "accessory_type": item.get("accessory_type"),
+                "price": item.get("price"),
+                "image_url": image_url,
+            }
+        )
+        if len(accessories_full) >= 1:
+            break
+    if not accessories_full:
+        # Approved empty-stock offer — nothing to attach at checkout.
+        if free or action in _GIFT_OFFER_ACTIONS:
+            return None
+        return None
+    display = negotiation.get("accessories") or []
+    if not isinstance(display, list):
+        display = []
+    return {
+        "approved": True,
+        "free_accessory": free,
+        "action": action or "offer_free_accessory",
+        "accessories_full": accessories_full,
+        "accessories": [str(a) for a in display if a][:3]
+        or [str(accessories_full[0].get("name") or "Complimentary accessory")],
+        "offered_price": negotiation.get("offered_price"),
+        "original_price": negotiation.get("original_price"),
+        "currency": negotiation.get("currency"),
+    }
+
+
 def _accepted_accessories(state: dict[str, Any]) -> list[dict[str, Any]]:
     negotiation = state.get("negotiation_result") if isinstance(state.get("negotiation_result"), dict) else {}
     if not negotiation:
         return []
     action = str(negotiation.get("action") or "")
-    if action in ("cutoff_and_pivot", "budget_pivot", "defend_value", "ask_color_preference"):
+    if action in _GIFT_BLOCK_ACTIONS:
         return []
-    if not (negotiation.get("free_accessory") or negotiation.get("approved")):
+    free = bool(negotiation.get("free_accessory"))
+    approved = bool(negotiation.get("approved"))
+    # Complimentary gifts, or approved gift / paid-upsell rows with SKUs.
+    if not (free or approved):
         return []
     raw = negotiation.get("accessories_full") or []
     rows: list[dict[str, Any]] = []
     for item in raw:
-        if isinstance(item, dict):
-            rows.append(item)
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("accessory_id") or item.get("id") or "").strip()
+        if not aid:
+            continue
+        rows.append(item)
     return rows
 
 
@@ -202,13 +280,54 @@ def build_checkout_items(state: dict[str, Any]) -> list[dict[str, Any]]:
                 item["quantity"] = qty
             items.append(item)
 
+    negotiation = state.get("negotiation_result") if isinstance(state.get("negotiation_result"), dict) else {}
+    complimentary = bool(negotiation.get("free_accessory"))
+
     seen: set[str] = set()
     for accessory in _accepted_accessories(state):
         accessory_id = str(accessory.get("accessory_id") or accessory.get("id") or "")
         if not accessory_id or accessory_id in seen:
             continue
         seen.add(accessory_id)
-        items.append({"item_type": "ACCESSORY", "accessory_id": accessory_id})
+        # Turabees POST /checkout auto-fetches ACCESSORY catalogue price and ignores
+        # unit_price overrides — complimentary gifts would inflate the bag (£1000+£85).
+        # Send free gifts as CUSTOM @ unit_price 0 so bag shows the pagri and total stays list.
+        if complimentary:
+            name = str(accessory.get("name") or "").strip() or "Complimentary accessory"
+            if not name.lower().startswith("complimentary"):
+                name = f"Complimentary {name}"
+            attrs: dict[str, Any] = {
+                "accessory_id": accessory_id,
+                "complimentary": True,
+            }
+            atype = accessory.get("accessory_type")
+            if atype:
+                attrs["accessory_type"] = atype
+            # CUSTOM lines do not auto-fetch accessory catalogue media — pass pagri image
+            # explicitly or the cart falls back to an unrelated placeholder.
+            image_url = accessory.get("image_url") or accessory.get("imageUrl")
+            if not image_url:
+                images = accessory.get("images") or []
+                if isinstance(images, list) and images:
+                    first = images[0]
+                    if isinstance(first, str):
+                        image_url = first
+                    elif isinstance(first, dict):
+                        image_url = first.get("url") or first.get("image_url")
+            if image_url:
+                attrs["generated_image_url"] = str(image_url)
+                attrs["image_url"] = str(image_url)
+            items.append(
+                {
+                    "item_type": "CUSTOM",
+                    "catalog_product_id": None,
+                    "item_name_snapshot": name,
+                    "unit_price": 0,
+                    "custom_attributes": attrs,
+                }
+            )
+        else:
+            items.append({"item_type": "ACCESSORY", "accessory_id": accessory_id})
     return items
 
 
