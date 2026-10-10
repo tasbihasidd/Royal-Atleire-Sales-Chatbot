@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy import select, delete
 
 from app.config import settings
+from app.core.bounded_cache import LRUDict
 from app.schemas.profile import CustomerProfileSchema
 from app.schemas.negotiation import NegotiationStateSchema
 from app.services.db import AsyncSessionLocal, UserProfile
@@ -12,7 +13,9 @@ from app.services.db import AsyncSessionLocal, UserProfile
 logger = logging.getLogger(__name__)
 
 # In-memory LRU fallback cache if Redis is not connected
-_LOCAL_CACHE: dict[str, dict[str, Any]] = {}
+_LOCAL_CACHE: LRUDict[str, dict[str, Any]] = LRUDict(
+    maxsize=int(getattr(settings, "MEMORY_CACHE_MAX_SESSIONS", 500) or 500)
+)
 
 
 class MemoryService:
@@ -21,7 +24,7 @@ class MemoryService:
         self._init_redis()
 
     def _init_redis(self) -> None:
-        redis_url = getattr(settings, "REDIS_URL", None) or "redis://localhost:6379/0"
+        redis_url = (getattr(settings, "REDIS_URL", None) or "redis://localhost:6379/0").strip()
         try:
             import redis.asyncio as aioredis
             self.redis_client = aioredis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1)

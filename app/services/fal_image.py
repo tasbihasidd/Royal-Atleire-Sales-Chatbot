@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -16,6 +17,7 @@ def generate_image_bytes_fal(
     image_urls: list[str] | None = None,
     image_size: str = "portrait_16_9",
 ) -> bytes:
+    """Sync helper (tests / scripts). Prefer ``generate_image_bytes_fal_async`` in routes."""
     urls = [u for u in (image_urls or []) if u]
     if urls:
         model_id = settings.FAL_IMAGE_MODEL
@@ -43,6 +45,46 @@ def generate_image_bytes_fal(
         raise RuntimeError(f"fal image generation returned no image url: {result!r}")
     with httpx.Client(timeout=60.0) as client:
         response = client.get(image_url)
+        response.raise_for_status()
+        return response.content
+
+
+async def generate_image_bytes_fal_async(
+    prompt: str,
+    *,
+    image_urls: list[str] | None = None,
+    image_size: str = "portrait_16_9",
+) -> bytes:
+    """Non-blocking for FastAPI: fal subscribe in a worker thread + async HTTP download."""
+    urls = [u for u in (image_urls or []) if u]
+    if urls:
+        model_id = settings.FAL_IMAGE_MODEL
+        arguments: dict[str, Any] = {
+            "prompt": prompt,
+            "image_urls": urls,
+            "image_size": image_size,
+            "num_images": 1,
+            "enable_safety_checker": True,
+        }
+        label = "seedream-edit"
+    else:
+        model_id = settings.FAL_IMAGE_T2I_MODEL
+        arguments = {
+            "prompt": prompt,
+            "image_size": image_size,
+            "num_images": 1,
+            "enable_safety_checker": True,
+        }
+        label = "seedream-t2i"
+
+    result = await asyncio.to_thread(
+        lambda: subscribe(model_id, arguments, label=label)
+    )
+    image_url = _first_image_url(result)
+    if not image_url:
+        raise RuntimeError(f"fal image generation returned no image url: {result!r}")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(image_url)
         response.raise_for_status()
         return response.content
 

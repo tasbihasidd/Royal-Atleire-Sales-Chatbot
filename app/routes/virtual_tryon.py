@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from app.config import settings
 from app.services.fal_runtime import upload_image_bytes
-from app.services.virtual_tryon import BRIA_TRYON_MODEL, run_virtual_tryon
+from app.services.virtual_tryon import BRIA_TRYON_MODEL, run_virtual_tryon_async
 
 logger = logging.getLogger(__name__)
 
@@ -237,8 +237,11 @@ async def virtual_tryon(payload: VirtualTryOnRequest, request: Request):
             product_bytes, content_type=product_ctype, file_name="product.jpg"
         )
     except Exception as exc:
-        logger.exception("virtual_tryon fal upload failed")
-        raise HTTPException(status_code=502, detail=f"Failed to stage images for try-on: {exc}") from exc
+        logger.exception("virtual_tryon fal upload failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to prepare images for try-on. Please try again.",
+        ) from exc
 
     model_id = (settings.FAL_TRYON_MODEL or BRIA_TRYON_MODEL).strip()
     logger.info(
@@ -249,18 +252,25 @@ async def virtual_tryon(payload: VirtualTryOnRequest, request: Request):
     )
 
     try:
-        result = run_virtual_tryon(
+        result = await run_virtual_tryon_async(
             person_image_url=person_fal,
             garment_image_url=product_fal,
             model=model_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.warning("virtual_tryon bad input: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid try-on images. Use public direct JPEG/PNG/WebP URLs.",
+        ) from exc
     except Exception as exc:
         status, detail = _friendly_tryon_error(exc)
         headers = None
         if isinstance(detail, dict) and detail.get("retry_after"):
             headers = {"Retry-After": str(detail["retry_after"])}
+        # Never leak raw provider exceptions to the client.
+        if isinstance(detail, str) and ("Traceback" in detail or len(detail) > 200):
+            detail = "Try-on failed. Please try again shortly."
         logger.exception("virtual_tryon failed model=%s", model_id)
         raise HTTPException(status_code=status, detail=detail, headers=headers) from exc
 

@@ -46,7 +46,12 @@ GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 class WeddingImageRequest(BaseModel):
     """Generate body: prompt + category + fabric + optional embroidery / bride match."""
 
-    prompt: str = Field(..., min_length=1, description="Free-text design brief for the outfit image")
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Free-text design brief for the outfit image",
+    )
     dress_category: Optional[str] = Field(
         default=None,
         description="Garment category from GET /api/generate-wedding-image/categories (alias: category)",
@@ -93,8 +98,8 @@ class WeddingImageRequest(BaseModel):
     bride_jewelry_tone: Optional[str] = Field(
         default=None, description="Optional bridal jewellery tone e.g. Gold, Silver"
     )
-    session_id: Optional[str] = None
-    user_id: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, max_length=255)
+    user_id: Optional[str] = Field(default=None, max_length=255)
     output_format: Literal["png", "jpeg", "webp"] = "png"
 
     model_config = {
@@ -700,13 +705,22 @@ async def generate_wedding_image(payload: WeddingImageRequest, request: Request)
 
 async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Request):
     try:
-        if not payload.session_id and settings.CHATBOT_QUOTA_ENFORCE:
-            raise HTTPException(
-                status_code=400,
-                detail="session_id is required for custom image generation (quota tracking).",
-            )
-        if payload.session_id:
-            decision = await require_quota(payload.session_id, "custom_image")
+        from app.core.session_identity import resolve_session_id
+
+        try:
+            session_id = resolve_session_id(request, payload.session_id)
+        except HTTPException:
+            if settings.CHATBOT_QUOTA_ENFORCE:
+                raise HTTPException(
+                    status_code=400,
+                    detail="session_id is required for custom image generation (quota tracking).",
+                ) from None
+            session_id = None
+        else:
+            payload.session_id = session_id
+
+        if session_id:
+            decision = await require_quota(session_id, "custom_image")
             if not decision.allowed:
                 raise HTTPException(
                     status_code=429,
@@ -788,12 +802,12 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
         )
         logger.info("Wedding prompt built prompt_length=%s", safe_len(prompt))
 
-        from app.services.fal_image import generate_image_bytes_fal
+        from app.services.fal_image import generate_image_bytes_fal_async
 
         fabric_urls = [swatch_url] if swatch_url else []
         if fabric_urls:
             prompt += swatch_tail_append(dye_color=payload.fabric_dye_color)
-        image_bytes = generate_image_bytes_fal(prompt, image_urls=fabric_urls)
+        image_bytes = await generate_image_bytes_fal_async(prompt, image_urls=fabric_urls)
 
         filename = save_generated_image(
             image_bytes=image_bytes,
@@ -859,14 +873,15 @@ async def _generate_wedding_image_impl(payload: WeddingImageRequest, request: Re
         ) from e
 
     except httpx.HTTPStatusError as e:
+        logger.warning("Could not fetch fabric image URL: %s", e)
         raise HTTPException(
             status_code=400,
-            detail=f"Could not fetch fabric image URL: {str(e)}",
-        )
+            detail="Could not fetch the fabric image. Check the fabric selection and try again.",
+        ) from e
 
     except Exception as e:
         logger.exception("Image generation failed: %s", e)
         raise HTTPException(
             status_code=500,
-            detail=f"Image generation failed: {str(e)}",
-        )
+            detail="Image generation failed. Please try again shortly.",
+        ) from e

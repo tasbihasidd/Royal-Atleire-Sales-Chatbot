@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -61,6 +62,7 @@ def run_virtual_tryon(
     garment_image_url: str,
     model: str | None = None,
 ) -> dict[str, Any]:
+    """Sync helper. Prefer ``run_virtual_tryon_async`` inside FastAPI handlers."""
     model_id = (model or settings.FAL_TRYON_MODEL or BRIA_TRYON_MODEL).strip()
     if not model_id:
         model_id = BRIA_TRYON_MODEL
@@ -77,6 +79,40 @@ def run_virtual_tryon(
 
     with httpx.Client(timeout=90.0) as client:
         response = client.get(fal_url)
+        response.raise_for_status()
+        image_bytes = response.content
+
+    return {
+        "model": model_id,
+        "fal_image_url": fal_url,
+        "image_bytes": image_bytes,
+    }
+
+
+async def run_virtual_tryon_async(
+    *,
+    person_image_url: str,
+    garment_image_url: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    model_id = (model or settings.FAL_TRYON_MODEL or BRIA_TRYON_MODEL).strip()
+    if not model_id:
+        model_id = BRIA_TRYON_MODEL
+
+    arguments = build_tryon_arguments(
+        model=model_id,
+        person_image_url=person_image_url,
+        garment_image_url=garment_image_url,
+    )
+    result = await asyncio.to_thread(
+        lambda: subscribe(model_id, arguments, label="virtual-tryon")
+    )
+    fal_url = _first_image_url(result)
+    if not fal_url:
+        raise RuntimeError(f"fal try-on returned no image url: {type(result).__name__}")
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        response = await client.get(fal_url)
         response.raise_for_status()
         image_bytes = response.content
 

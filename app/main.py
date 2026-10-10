@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -16,6 +16,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.agent.graph import sales_agent_graph
 from app.config import settings
+from app.core.api_key_auth import ApiKeyMiddleware
+from app.core.session_identity import resolve_session_id
 from app.core.logging_config import (
     get_request_id,
     reset_request_id,
@@ -111,20 +113,62 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             reset_request_id(token)
 
 
+_DEV_DOCS = bool(settings.ENABLE_DEV_ENDPOINTS)
+
 app = FastAPI(
     title="Royal Atelier Sales Agent",
     description="LangGraph + LangChain sales chatbot with PostgreSQL session storage.",
     lifespan=lifespan,
+    docs_url="/docs" if _DEV_DOCS else None,
+    redoc_url="/redoc" if _DEV_DOCS else None,
+    openapi_url="/openapi.json" if _DEV_DOCS else None,
 )
 
+_cors_origins = list(settings.CORS_ORIGINS or [])
+if not _cors_origins:
+    logger.warning("CORS_ORIGINS empty — falling back to localhost-only list")
+    _cors_origins = ["http://localhost:8015", "http://127.0.0.1:8015"]
+logger.info(
+    "CORS configured origins=%s credentials=True app_env=%s dev_endpoints=%s",
+    _cors_origins,
+    settings.APP_ENV,
+    settings.ENABLE_DEV_ENDPOINTS,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 app.add_middleware(RequestLoggingMiddleware)
+
+
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        max_bytes = int(settings.MAX_REQUEST_BODY_BYTES or 1_048_576)
+        cl = request.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > max_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body too large."},
+                    )
+            except ValueError:
+                pass
+        return await call_next(request)
+
+
+app.add_middleware(BodySizeLimitMiddleware)
+# Outermost (after CORS): require X-Api-Key on AI / write routes when configured.
+app.add_middleware(ApiKeyMiddleware)
+if settings.CHATBOT_API_KEY:
+    logger.info("X-Api-Key auth enabled for AI routes (CHATBOT_API_KEY set)")
+elif settings.is_prod:
+    logger.error("CHATBOT_API_KEY is empty in production — AI routes will return 503")
+else:
+    logger.warning("CHATBOT_API_KEY unset — AI routes are open in this env (dev only)")
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -133,8 +177,17 @@ app.include_router(virtual_tryon_router)
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., examples=["user-session-123"])
-    message: str = Field(..., examples=["Mujhe Nikah ke liye cream Sherwani chahiye, size 40 available hai?"])
+    session_id: str | None = Field(
+        default=None,
+        max_length=255,
+        examples=["user-session-123"],
+        description="Dev / legacy: browser session id. Prod prefers HttpOnly cookie.",
+    )
+    message: str = Field(
+        ...,
+        max_length=2000,
+        examples=["Mujhe Nikah ke liye cream Sherwani chahiye, size 40 available hai?"],
+    )
 
 
 class ChatResponse(BaseModel):
@@ -229,19 +282,20 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(payload: ChatRequest, request: Request):
     try:
+        session_id = resolve_session_id(request, payload.session_id)
         logger.info(
             "Chat request start session_id=%s message_length=%s",
-            request.session_id,
-            safe_len(request.message),
+            session_id,
+            safe_len(payload.message),
         )
 
-        quota = await require_quota(request.session_id, "ai_message")
+        quota = await require_quota(session_id, "ai_message")
         if not quota.allowed:
             logger.info(
                 "Chat quota exceeded session_id=%s used=%s limits=%s",
-                request.session_id,
+                session_id,
                 quota.used,
                 quota.limits,
             )
@@ -258,30 +312,30 @@ async def chat(request: ChatRequest):
                 },
             )
 
-        await chat_store.ensure_session(request.session_id)
+        await chat_store.ensure_session(session_id)
         await chat_store.add_message(
-            session_id=request.session_id,
+            session_id=session_id,
             role="user",
-            content=request.message,
+            content=payload.message,
         )
 
-        history = await chat_store.get_messages(request.session_id, limit=20)
+        history = await chat_store.get_messages(session_id, limit=20)
         logger.info(
             "Chat history loaded session_id=%s message_count=%s",
-            request.session_id,
+            session_id,
             len(history),
         )
 
-        customer_contact = await chat_store.load_customer_contact(request.session_id, history)
-        session_context = await chat_store.load_session_context(request.session_id, history)
-        profile, negotiation_state = await memory_service.load_session_context(request.session_id)
+        customer_contact = await chat_store.load_customer_contact(session_id, history)
+        session_context = await chat_store.load_session_context(session_id, history)
+        profile, negotiation_state = await memory_service.load_session_context(session_id)
 
 
         # Keep metadata (esp. products) so get_product_details can rematch
         # previously shown pieces by name after a later empty search turn.
         initial_state = {
-            "session_id": request.session_id,
-            "user_message": request.message,
+            "session_id": session_id,
+            "user_message": payload.message,
             "messages": [
                 {
                     "role": m["role"],
@@ -350,9 +404,9 @@ async def chat(request: ChatRequest):
 
 
         config = {
-            "configurable": {"thread_id": request.session_id},
+            "configurable": {"thread_id": session_id},
             "metadata": {
-                "session_id": request.session_id,
+                "session_id": session_id,
                 "request_id": get_request_id(),
             },
             "tags": [
@@ -361,15 +415,15 @@ async def chat(request: ChatRequest):
                 str(settings.LLM_PROVIDER or "fal"),
             ],
         }
-        logger.info("LangGraph invoke start session_id=%s", request.session_id)
-        with session_cost_scope(request.session_id):
+        logger.info("LangGraph invoke start session_id=%s", session_id)
+        with session_cost_scope(session_id):
             result = await sales_agent_graph.ainvoke(initial_state, config=config)
         executed_nodes = list(result.get("executed_nodes") or [])
         logger.info(
             "LangGraph invoke end session_id=%s intent=%s required_steps=%s "
             "executed_nodes=%s products_count=%s has_inventory=%s has_negotiation=%s "
             "has_measurement=%s has_handover=%s",
-            request.session_id,
+            session_id,
             result.get("intent"),
             result.get("required_steps"),
             executed_nodes,
@@ -384,7 +438,7 @@ async def chat(request: ChatRequest):
         if not reply:
             logger.warning(
                 "Chat empty final_response fallback session_id=%s",
-                request.session_id,
+                session_id,
             )
             reply = (
                 "I apologise — I could not finish that reply. "
@@ -394,7 +448,7 @@ async def chat(request: ChatRequest):
         imageurl = _resolve_chat_image_url(result)
 
         await chat_store.add_message(
-            session_id=request.session_id,
+            session_id=session_id,
             role="assistant",
             content=reply,
             metadata={
@@ -441,12 +495,12 @@ async def chat(request: ChatRequest):
 
         if result.get("customer_contact"):
             await chat_store.update_session_metadata(
-                request.session_id,
+                session_id,
                 {"customer_contact": result.get("customer_contact")},
             )
 
         updated_context = chat_store.build_session_context_from_result(result, session_context)
-        await chat_store.save_session_context(request.session_id, updated_context)
+        await chat_store.save_session_context(session_id, updated_context)
 
         # Persist customer profile and negotiation state via memory_service
         profile_data = result.get("customer_profile") or profile.model_dump()
@@ -470,11 +524,11 @@ async def chat(request: ChatRequest):
 
         updated_profile = CustomerProfileSchema(**profile_data)
         updated_negotiation = NegotiationStateSchema(**(result.get("negotiation_state") or negotiation_state.model_dump()))
-        await memory_service.save_session_context(request.session_id, updated_profile, updated_negotiation)
+        await memory_service.save_session_context(session_id, updated_profile, updated_negotiation)
 
         logger.info(
             "Assistant response saved session_id=%s reply_length=%s imageurl_present=%s",
-            request.session_id,
+            session_id,
             safe_len(reply),
             bool(imageurl),
         )
@@ -536,7 +590,7 @@ async def chat(request: ChatRequest):
             "cut_style": result.get("cut_style"),
         }
         if settings.INCLUDE_COST_IN_RESPONSE:
-            state_payload["cost"] = get_session_cost(request.session_id)
+            state_payload["cost"] = get_session_cost(session_id)
         return ChatResponse(
             reply=reply,
             imageurl=imageurl,
@@ -546,7 +600,7 @@ async def chat(request: ChatRequest):
     except BackendAPIError as exc:
         logger.exception(
             "Chat backend unavailable session_id=%s status=%s path=%s",
-            request.session_id,
+            session_id,
             exc.status_code,
             exc.path,
         )
@@ -556,7 +610,7 @@ async def chat(request: ChatRequest):
             "Please try again in a moment, or share your WhatsApp so a Style Consultant can assist you directly."
         )
         await chat_store.add_message(
-            session_id=request.session_id,
+            session_id=session_id,
             role="assistant",
             content=soft,
             metadata={"backend_error": True, "status_code": exc.status_code},
@@ -565,13 +619,13 @@ async def chat(request: ChatRequest):
     except FalProviderError as exc:
         logger.warning(
             "Chat fal provider error session_id=%s code=%s fal_status=%s",
-            request.session_id,
+            session_id,
             exc.code,
             exc.fal_status,
         )
         soft = exc.message
         await chat_store.add_message(
-            session_id=request.session_id,
+            session_id=session_id,
             role="assistant",
             content=soft,
             metadata={"fal_error": True, "code": exc.code, "fal_status": exc.fal_status},
@@ -587,49 +641,39 @@ async def chat(request: ChatRequest):
             },
         )
     except Exception:
-        logger.exception("Chat request failed session_id=%s", request.session_id)
+        logger.exception("Chat request failed session_id=%s", session_id)
         soft = (
             "I apologise — something went wrong on my side. "
             "Please try again shortly, or leave your WhatsApp for a Style Consultant."
         )
         try:
             await chat_store.add_message(
-                session_id=request.session_id,
+                session_id=session_id,
                 role="assistant",
                 content=soft,
                 metadata={"internal_error": True},
             )
         except Exception:
-            logger.exception("Failed to persist soft-error reply session_id=%s", request.session_id)
+            logger.exception("Failed to persist soft-error reply session_id=%s", session_id)
         return ChatResponse(reply=soft, imageurl=None, executed_nodes=[], state={"internal_error": True})
 
 
-@app.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 50):
-    messages = await chat_store.get_messages(session_id=session_id, limit=limit)
-    logger.info(
-        "Session messages fetched session_id=%s limit=%s message_count=%s",
-        session_id,
-        limit,
-        len(messages),
-    )
-    return {"session_id": session_id, "messages": messages}
+def _require_dev_endpoints() -> None:
+    if not settings.ENABLE_DEV_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found.")
 
 
-@app.get("/sessions/{session_id}/cost")
-async def get_session_ai_cost(session_id: str):
-    """In-memory estimated AI cost for a session (LLM tokens + fal image/try-on)."""
-    cost = get_session_cost(session_id)
-    return {
-        "session_id": session_id,
-        "cost": cost,
-        "langsmith_tracing": bool(settings.LANGSMITH_TRACING),
-        "langsmith_project": settings.LANGSMITH_PROJECT if settings.LANGSMITH_TRACING else None,
-        "note": (
-            "Memory-only estimates for this process. "
-            "Filter LangSmith by metadata.session_id for durable analytics."
-        ),
-    }
+def _require_quota_admin_key(x_admin_key: str | None) -> None:
+    expected = (settings.QUOTA_ADMIN_KEY or "").strip()
+    if settings.is_prod and not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Quota reset is disabled until QUOTA_ADMIN_KEY is configured.",
+        )
+    if expected and (x_admin_key or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key.")
+    if not expected:
+        logger.warning("quota/reset called with QUOTA_ADMIN_KEY unset (dev only)")
 
 
 @app.get("/sessions/{session_id}/quota")
@@ -651,12 +695,10 @@ async def reset_session_quota(
     """
     Admin: reset today's quota usage for a chatbot session (waive counters, keep history).
 
-    Use when a user hits 429 on generate-wedding-image / chat.
-    If QUOTA_ADMIN_KEY is set in env, pass the same value as header X-Admin-Key.
+    Prod always requires QUOTA_ADMIN_KEY via X-Admin-Key.
+    Dev: open only when QUOTA_ADMIN_KEY is unset.
     """
-    expected = (settings.QUOTA_ADMIN_KEY or "").strip()
-    if expected and (x_admin_key or "").strip() != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key.")
+    _require_quota_admin_key(x_admin_key)
 
     kind_norm = (kind or "custom_image").strip().lower()
     if kind_norm in ("image", "images", "custom_images"):
@@ -673,51 +715,84 @@ async def reset_session_quota(
     return result
 
 
-@app.get("/api/sessions")
-async def list_sessions(limit: int = 50):
-    """List recent sessions for workbench switcher."""
-    sessions = await chat_store.list_recent_sessions(limit=limit)
-    return {"sessions": sessions}
+if settings.ENABLE_DEV_ENDPOINTS:
 
+    @app.get("/sessions/{session_id}/messages")
+    async def get_session_messages(session_id: str, limit: int = 50):
+        _require_dev_endpoints()
+        messages = await chat_store.get_messages(session_id=session_id, limit=limit)
+        logger.info(
+            "Session messages fetched session_id=%s limit=%s message_count=%s",
+            session_id,
+            limit,
+            len(messages),
+        )
+        return {"session_id": session_id, "messages": messages}
 
-@app.post("/api/sessions/{session_id}/clear")
-async def clear_session_endpoint(session_id: str):
-    """Clear a single session from Redis cache, memory fallback, and PostgreSQL."""
-    await memory_service.clear_session(session_id)
-    await chat_store.clear_session(session_id)
-    clear_session_cost(session_id)
-    logger.info("Session cleared session_id=%s", session_id)
-    return {
-        "status": "ok",
-        "message": f"Session '{session_id}' successfully cleared from Redis and PostgreSQL.",
-        "session_id": session_id,
-    }
+    @app.get("/sessions/{session_id}/cost")
+    async def get_session_ai_cost(session_id: str):
+        """In-memory estimated AI cost for a session (LLM tokens + fal image/try-on)."""
+        _require_dev_endpoints()
+        cost = get_session_cost(session_id)
+        return {
+            "session_id": session_id,
+            "cost": cost,
+            "langsmith_tracing": bool(settings.LANGSMITH_TRACING),
+            "langsmith_project": settings.LANGSMITH_PROJECT if settings.LANGSMITH_TRACING else None,
+            "note": (
+                "Memory-only estimates for this process. "
+                "Filter LangSmith by metadata.session_id for durable analytics."
+            ),
+        }
 
+    @app.get("/api/sessions")
+    async def list_sessions(limit: int = 50):
+        """List recent sessions for workbench switcher."""
+        _require_dev_endpoints()
+        sessions = await chat_store.list_recent_sessions(limit=limit)
+        return {"sessions": sessions}
 
-@app.post("/api/sessions/clear-all")
-async def clear_all_sessions_endpoint():
-    """Clear all sessions from Redis, in-memory cache, and PostgreSQL."""
-    mem_result = await memory_service.clear_all_sessions()
-    chat_result = await chat_store.clear_all_sessions()
-    logger.info("All sessions cleared: %s, %s", mem_result, chat_result)
-    return {
-        "status": "ok",
-        "message": "All sessions successfully cleared from Redis and PostgreSQL.",
-        "details": {**mem_result, **chat_result},
-    }
+    @app.post("/api/sessions/{session_id}/clear")
+    async def clear_session_endpoint(session_id: str):
+        """Clear a single session from Redis cache, memory fallback, and PostgreSQL."""
+        _require_dev_endpoints()
+        await memory_service.clear_session(session_id)
+        await chat_store.clear_session(session_id)
+        clear_session_cost(session_id)
+        logger.info("Session cleared session_id=%s", session_id)
+        return {
+            "status": "ok",
+            "message": f"Session '{session_id}' successfully cleared from Redis and PostgreSQL.",
+            "session_id": session_id,
+        }
 
+    @app.post("/api/sessions/clear-all")
+    async def clear_all_sessions_endpoint():
+        """Clear all sessions from Redis, in-memory cache, and PostgreSQL."""
+        _require_dev_endpoints()
+        mem_result = await memory_service.clear_all_sessions()
+        chat_result = await chat_store.clear_all_sessions()
+        logger.info("All sessions cleared: %s, %s", mem_result, chat_result)
+        return {
+            "status": "ok",
+            "message": "All sessions successfully cleared from Redis and PostgreSQL.",
+            "details": {**mem_result, **chat_result},
+        }
 
-@app.get("/debug/image-generations")
-async def debug_image_generations(limit: int = 20):
-    """Debug endpoint to inspect prompts, inputs, and URLs of generated wedding images."""
-    records = await image_store.list_recent_records(limit=limit)
-    return {"count": len(records), "records": records}
+    @app.get("/debug/image-generations")
+    async def debug_image_generations(limit: int = 20):
+        """Debug endpoint to inspect prompts, inputs, and URLs of generated wedding images."""
+        _require_dev_endpoints()
+        records = await image_store.list_recent_records(limit=limit)
+        return {"count": len(records), "records": records}
 
-
-@app.get("/test", response_class=HTMLResponse)
-async def test_workbench():
-    """Serve the interactive HTML testing workbench."""
-    index_path = Path("index.html")
-    if index_path.exists():
-        return FileResponse(str(index_path))
-    return HTMLResponse("<h1>Tester UI index.html not found</h1>", status_code=404)
+    @app.get("/test", response_class=HTMLResponse)
+    async def test_workbench():
+        """Serve the interactive HTML testing workbench."""
+        _require_dev_endpoints()
+        index_path = Path("index.html")
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        return HTMLResponse("<h1>Tester UI index.html not found</h1>", status_code=404)
+else:
+    logger.info("Dev endpoints disabled (APP_ENV=%s ENABLE_DEV_ENDPOINTS=false)", settings.APP_ENV)

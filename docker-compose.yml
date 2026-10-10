@@ -8,7 +8,11 @@ services:
       - .env
     environment:
       # DB via container DNS. PORT + BASE_URL come from .env.
-      DATABASE_URL: postgresql+asyncpg://royal:royal@postgres:5432/royal_atelier
+      # Override POSTGRES_PASSWORD in .env for non-local deploys.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-royal}:${POSTGRES_PASSWORD:-royal}@postgres:5432/${POSTGRES_DB:-royal_atelier}
+      APP_ENV: ${APP_ENV:-dev}
+      ENABLE_DEV_ENDPOINTS: ${ENABLE_DEV_ENDPOINTS:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       - postgres
     volumes:
@@ -20,13 +24,12 @@ services:
     image: postgres:16
     container_name: royal_atelier_postgres
     environment:
-      POSTGRES_DB: royal_atelier
-      POSTGRES_USER: royal
-      POSTGRES_PASSWORD: royal
-    # Host uvicorn only — :5432 is often another project's DB (e.g. tudor).
-    # API container still uses compose override @postgres:5432.
+      POSTGRES_DB: ${POSTGRES_DB:-royal_atelier}
+      POSTGRES_USER: ${POSTGRES_USER:-royal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-royal}
+    # Bind to localhost only — do not expose Postgres on the public interface.
     ports:
-      - "22006:5432"
+      - "127.0.0.1:22006:5432"
     volumes:
       - royal_atelier_postgres_data:/var/lib/postgresql/data
     restart: unless-stopped

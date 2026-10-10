@@ -4870,6 +4870,15 @@ async def close_sale_node(state: SalesAgentState) -> dict[str, Any]:
             api_result = {"success": False}
         checkout_url = api_result.get("checkout_url") if isinstance(api_result, dict) else None
         checkout_session_id = api_result.get("session_id") if isinstance(api_result, dict) else None
+        # Never share unsigned ?cart= base64 links — only secure ?s= session codes.
+        from app.core.session_identity import is_unsigned_cart_checkout_url
+
+        if checkout_url and is_unsigned_cart_checkout_url(str(checkout_url)):
+            logger.error(
+                "close_sale_node rejected insecure ?cart= checkout_url session_id=%s",
+                state.get("session_id"),
+            )
+            checkout_url = None
         if checkout_url:
             close_result["status"] = "ready_for_checkout_link"
             close_result["checkout_url"] = checkout_url

@@ -6,6 +6,8 @@ from typing import Any
 
 from sqlalchemy import select, delete, func
 
+from app.config import settings
+from app.core.bounded_cache import LRUDict
 from app.core.logging_config import safe_len
 from app.services.db import AsyncSessionLocal, ChatMessage, ChatSession
 
@@ -14,8 +16,9 @@ logger = logging.getLogger(__name__)
 QUOTA_WAIVED_KEY = "_quota_waived"
 
 # In-memory fallback when Postgres is unavailable (hard-test / degraded env).
-_MEM_SESSIONS: dict[str, dict[str, Any]] = {}
-_MEM_MESSAGES: dict[str, list[dict[str, Any]]] = {}
+_MEM_MAX = int(getattr(settings, "MEMORY_CACHE_MAX_SESSIONS", 500) or 500)
+_MEM_SESSIONS: LRUDict[str, dict[str, Any]] = LRUDict(maxsize=_MEM_MAX)
+_MEM_MESSAGES: LRUDict[str, list[dict[str, Any]]] = LRUDict(maxsize=_MEM_MAX)
 
 
 SESSION_CONTEXT_KEYS = (
